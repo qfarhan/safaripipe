@@ -809,6 +809,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -823,6 +824,7 @@ Line by line:
 - `json` decodes Kafka message bytes and prints results.
 - `subprocess` triggers the next component.
 - `sys` provides the current Python executable and stdout flushing.
+- `time` enforces the delay between non-empty Kafka batches.
 - `Path` handles debug files.
 - `Any` and `Iterable` type the Kafka message helpers.
 - `load_config` reads environment config.
@@ -830,6 +832,20 @@ Line by line:
 - `load_json_file` supports manual debug input.
 - `write_json_file` saves converted messages.
 - `convert_control_message` performs the core transformation.
+
+Add batching defaults:
+
+```python
+DEFAULT_BATCH_INTERVAL_SECONDS = 600.0
+DEFAULT_BATCH_MAX_RECORDS = 100
+DEFAULT_POLL_TIMEOUT_MS = 1000
+```
+
+Line by line:
+
+- `DEFAULT_BATCH_INTERVAL_SECONDS = 600.0` means the continuous consumer processes at most one non-empty batch every ten minutes.
+- `DEFAULT_BATCH_MAX_RECORDS = 100` caps how many Kafka records can be processed in one batch.
+- `DEFAULT_POLL_TIMEOUT_MS = 1000` keeps empty polls responsive without spinning tightly.
 
 Add Kafka value decoding:
 
@@ -875,6 +891,7 @@ def create_kafka_consumer(kafka_config: dict[str, Any]):
         auto_offset_reset=kafka_config.get("auto_offset_reset", "latest"),
         enable_auto_commit=kafka_config.get("enable_auto_commit", True),
         security_protocol=kafka_config.get("security_protocol", "PLAINTEXT"),
+        max_poll_interval_ms=kafka_config.get("max_poll_interval_ms", 900000),
         value_deserializer=lambda value: decode_kafka_value(value),
     )
 ```
@@ -891,6 +908,7 @@ Line by line:
 - `auto_offset_reset` decides where to start when there is no committed offset.
 - `enable_auto_commit` controls automatic offset commits.
 - `security_protocol` supports local plaintext and production SSL/SASL settings.
+- `max_poll_interval_ms` is set higher than ten minutes so Kafka does not remove the consumer from the group while it waits between batches.
 - `value_deserializer` turns Kafka bytes into dictionaries immediately.
 
 Add metadata helpers:
@@ -975,6 +993,69 @@ Line by line:
 - `text=True` returns stdout/stderr as strings.
 - `capture_output=True` stores stdout/stderr so the consumer can include them in its JSON output.
 
+Add batch helpers:
+
+```python
+def flatten_polled_records(polled_records: dict[Any, list[Any]] | None) -> list[Any]:
+    if not polled_records:
+        return []
+
+    messages: list[Any] = []
+    for partition_records in polled_records.values():
+        messages.extend(partition_records)
+    return messages
+
+
+def seconds_until_next_batch(batch_started_at: float, batch_interval_seconds: float) -> float:
+    if batch_interval_seconds <= 0:
+        return 0.0
+    elapsed_seconds = time.monotonic() - batch_started_at
+    return max(0.0, batch_interval_seconds - elapsed_seconds)
+
+
+def resolve_batch_options(
+    consumer_config: dict[str, Any],
+    *,
+    batch_max_records: int | None,
+    batch_interval_seconds: float | None,
+    poll_timeout_ms: int | None,
+) -> tuple[int, float, int]:
+    resolved_max_records = int(
+        batch_max_records
+        if batch_max_records is not None
+        else consumer_config.get("batch_max_records", DEFAULT_BATCH_MAX_RECORDS)
+    )
+    resolved_interval_seconds = float(
+        batch_interval_seconds
+        if batch_interval_seconds is not None
+        else consumer_config.get("batch_interval_seconds", DEFAULT_BATCH_INTERVAL_SECONDS)
+    )
+    resolved_poll_timeout_ms = int(
+        poll_timeout_ms
+        if poll_timeout_ms is not None
+        else consumer_config.get("poll_timeout_ms", DEFAULT_POLL_TIMEOUT_MS)
+    )
+
+    if resolved_max_records <= 0:
+        raise ValueError("batch_max_records must be greater than 0")
+    if resolved_interval_seconds < 0:
+        raise ValueError("batch_interval_seconds cannot be negative")
+    if resolved_poll_timeout_ms <= 0:
+        raise ValueError("poll_timeout_ms must be greater than 0")
+
+    return resolved_max_records, resolved_interval_seconds, resolved_poll_timeout_ms
+```
+
+Line by line:
+
+- `flatten_polled_records` turns Kafka's partition-grouped `poll()` result into a single list of messages.
+- Empty polls return an empty list.
+- `seconds_until_next_batch` computes how much of the configured interval remains after processing a batch.
+- `time.monotonic()` is used for elapsed time because it is stable even if the system clock changes.
+- `max(0.0, ...)` prevents negative sleep times when processing takes longer than the interval.
+- `resolve_batch_options` merges config values with optional CLI overrides.
+- The validations prevent accidental zero-record batches, negative intervals, and zero-timeout busy loops.
+
 Add the core processing function:
 
 ```python
@@ -1048,22 +1129,44 @@ def consume_messages(
     once: bool,
     trigger_next: bool | None,
     dry_run_next: bool,
+    batch_max_records: int | None = None,
+    batch_interval_seconds: float | None = None,
+    poll_timeout_ms: int | None = None,
 ) -> Iterable[dict[str, Any]]:
     config = load_config(env)
+    resolved_max_records, resolved_interval_seconds, resolved_poll_timeout_ms = resolve_batch_options(
+        config.consumer,
+        batch_max_records=batch_max_records,
+        batch_interval_seconds=batch_interval_seconds,
+        poll_timeout_ms=poll_timeout_ms,
+    )
     consumer = create_kafka_consumer(config.kafka)
     try:
-        for kafka_message in consumer:
-            result = process_payload(
-                payload=kafka_message.value,
-                env=env,
-                source="kafka",
-                kafka_metadata=message_metadata(kafka_message),
-                trigger_next=trigger_next,
-                dry_run_next=dry_run_next,
+        while True:
+            batch_started_at = time.monotonic()
+            kafka_messages = flatten_polled_records(
+                consumer.poll(timeout_ms=resolved_poll_timeout_ms, max_records=resolved_max_records)
             )
-            yield result
+            if not kafka_messages:
+                continue
+
+            for kafka_message in kafka_messages:
+                result = process_payload(
+                    payload=kafka_message.value,
+                    env=env,
+                    source="kafka",
+                    kafka_metadata=message_metadata(kafka_message),
+                    trigger_next=trigger_next,
+                    dry_run_next=dry_run_next,
+                )
+                yield result
+
             if once:
                 break
+
+            sleep_seconds = seconds_until_next_batch(batch_started_at, resolved_interval_seconds)
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
     finally:
         consumer.close()
 ```
@@ -1071,15 +1174,22 @@ def consume_messages(
 Line by line:
 
 - `consume_messages` is a generator so callers can print each result as messages arrive.
-- `once` supports integration tests and debug runs.
+- `once` supports integration tests and debug runs by processing one batch and exiting.
+- The optional batch arguments let CLI flags override config.
 - Load config and create a Kafka consumer.
+- `resolve_batch_options(...)` combines config defaults and CLI overrides.
 - `try/finally` guarantees the consumer closes.
-- `for kafka_message in consumer` blocks until Kafka messages arrive.
+- `while True` keeps the server running.
+- `batch_started_at = time.monotonic()` records when the batch window began.
+- `consumer.poll(...)` fetches up to the configured max records.
+- Empty polls do not count as consumed batches, so the loop polls again.
 - `kafka_message.value` is already decoded by the configured deserializer.
 - `source="kafka"` marks live input.
 - `message_metadata(...)` records topic, partition, offset, timestamp, and key.
 - `yield result` returns one processed message to the CLI.
-- `if once: break` exits after one message when requested.
+- `if once: break` exits after one batch when requested.
+- `seconds_until_next_batch(...)` calculates the remaining wait time.
+- `time.sleep(...)` prevents more than one non-empty batch from being consumed during the configured interval.
 - `consumer.close()` releases network resources.
 
 Add CLI parsing:
@@ -1088,22 +1198,32 @@ Add CLI parsing:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Consume Kafka control messages and save converted JSON.")
     parser.add_argument("--env", default="local", help="Config environment name, e.g. local/dev/prod.")
-    parser.add_argument("--once", action="store_true", help="Consume one Kafka message and exit.")
+    parser.add_argument("--once", action="store_true", help="Consume one Kafka batch and exit.")
     parser.add_argument("--message-file", help="Debug mode: read this JSON file instead of Kafka.")
     parser.add_argument("--trigger-next", action="store_true", help="Trigger the Elasticsearch lookup component.")
     parser.add_argument("--no-trigger-next", action="store_true", help="Do not trigger the next component.")
     parser.add_argument("--dry-run-next", action="store_true", help="Pass --dry-run to the next component.")
+    parser.add_argument("--batch-max-records", type=int, help="Maximum Kafka records to process in one batch.")
+    parser.add_argument(
+        "--batch-interval-seconds",
+        type=float,
+        help="Minimum seconds between non-empty Kafka batches. Defaults to 600.",
+    )
+    parser.add_argument("--poll-timeout-ms", type=int, help="Kafka poll timeout in milliseconds.")
     return parser.parse_args()
 ```
 
 Line by line:
 
 - `--env` chooses config.
-- `--once` makes live Kafka mode exit after one message.
+- `--once` makes live Kafka mode exit after one batch.
 - `--message-file` switches to manual debug mode.
 - `--trigger-next` forces chaining on.
 - `--no-trigger-next` forces chaining off.
 - `--dry-run-next` makes the ES lookup print the query without connecting to ES.
+- `--batch-max-records` overrides the configured batch size.
+- `--batch-interval-seconds` overrides the configured wait between non-empty batches.
+- `--poll-timeout-ms` overrides the Kafka poll timeout.
 
 Add trigger override validation and `main`:
 
@@ -1139,6 +1259,9 @@ def main() -> None:
         once=args.once,
         trigger_next=trigger_next,
         dry_run_next=args.dry_run_next,
+        batch_max_records=args.batch_max_records,
+        batch_interval_seconds=args.batch_interval_seconds,
+        poll_timeout_ms=args.poll_timeout_ms,
     ):
         print(json.dumps(result, indent=2, sort_keys=True))
         sys.stdout.flush()
@@ -1669,4 +1792,3 @@ Use this order when recreating the codebase:
 15. Run Docker e2e.
 
 That order keeps each step testable. The project grows from pure functions, to file IO, to CLIs, to external services.
-

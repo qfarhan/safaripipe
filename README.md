@@ -52,7 +52,7 @@ Run the end-to-end test:
 ./scripts/bootstrap_e2e_docker.sh
 ```
 
-That script indexes a test Elasticsearch document, publishes `samples/control_message.json` to Kafka, consumes one Kafka message, saves the converted JSON, and triggers the Elasticsearch lookup.
+That script indexes a test Elasticsearch document, publishes `samples/control_message.json` to Kafka, consumes one Kafka batch, saves the converted JSON, and triggers the Elasticsearch lookup.
 
 ## Rebuild Tutorial
 
@@ -66,7 +66,16 @@ Listen continuously:
 python -m etl.kafka_consumer --env dev
 ```
 
-Read one Kafka message then exit:
+By default, the live consumer processes at most one configured batch every 10 minutes. Tune that in the selected config with:
+
+```toml
+[consumer]
+batch_max_records = 100
+batch_interval_seconds = 600
+poll_timeout_ms = 1000
+```
+
+Read one Kafka batch then exit:
 
 ```bash
 python -m etl.kafka_consumer --env dev --once
