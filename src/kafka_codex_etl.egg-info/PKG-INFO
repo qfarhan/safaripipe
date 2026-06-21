@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: kafka-codex-etl
+Version: 0.1.0
+Summary: Two-component ETL pipeline for Kafka control messages and Elasticsearch lookups.
+Requires-Python: >=3.11
+Requires-Dist: elasticsearch<9,>=8.13
+Requires-Dist: kafka-python<3,>=2.0.2
+Provides-Extra: dev
+Requires-Dist: pytest<9,>=8; extra == "dev"

@@ -1,0 +1,28 @@
+[pipeline]
+environment = "local"
+
+[kafka]
+bootstrap_servers = ["localhost:9092"]
+topic = "control-topic"
+group_id = "etl-local"
+client_id = "etl-control-consumer-local"
+auto_offset_reset = "earliest"
+enable_auto_commit = true
+security_protocol = "PLAINTEXT"
+
+[consumer]
+output_dir = "data/converted"
+trigger_next = true
+next_command = ["python", "-m", "etl.es_lookup"]
+
+[message]
+id_attribute = "event_id"
+
+[elasticsearch]
+hosts = ["http://localhost:9200"]
+index = "source-index"
+request_timeout_seconds = 30
+verify_certs = false
+username = ""
+password = ""
+api_key = ""

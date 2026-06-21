@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+src/etl/__init__.py
+src/etl/config.py
+src/etl/es_lookup.py
+src/etl/json_io.py
+src/etl/kafka_consumer.py
+src/etl/message.py
+src/kafka_codex_etl.egg-info/PKG-INFO
+src/kafka_codex_etl.egg-info/SOURCES.txt
+src/kafka_codex_etl.egg-info/dependency_links.txt
+src/kafka_codex_etl.egg-info/requires.txt
+src/kafka_codex_etl.egg-info/top_level.txt
+tests/test_es_lookup.py
+tests/test_message.py

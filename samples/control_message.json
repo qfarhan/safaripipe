@@ -1,0 +1,10 @@
+{
+  "event_id": "customer-123",
+  "event_type": "customer.updated",
+  "source_index": "source-index",
+  "published_at": "2026-06-21T00:00:00Z",
+  "attributes": {
+    "tenant": "demo",
+    "priority": "normal"
+  }
+}

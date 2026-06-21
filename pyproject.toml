@@ -1,0 +1,18 @@
+[project]
+name = "kafka-codex-etl"
+version = "0.1.0"
+description = "Two-component ETL pipeline for Kafka control messages and Elasticsearch lookups."
+requires-python = ">=3.11"
+dependencies = [
+  "elasticsearch>=8.13,<9",
+  "kafka-python>=2.0.2,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

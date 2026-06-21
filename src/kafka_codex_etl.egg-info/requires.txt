@@ -1,0 +1,5 @@
+elasticsearch<9,>=8.13
+kafka-python<3,>=2.0.2
+
+[dev]
+pytest<9,>=8
