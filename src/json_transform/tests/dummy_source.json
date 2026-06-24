@@ -1,0 +1,187 @@
+{
+  "took": 12,
+  "timed_out": false,
+  "_shards": {
+    "total": 16,
+    "successful": 16,
+    "skipped": 0,
+    "failed": 0
+  },
+  "hits": {
+    "total": {
+      "value": 2,
+      "relation": "eq"
+    },
+    "max_score": null,
+    "hits": [
+      {
+        "_index": "prod.master.murex.trade.eod.v1-000014",
+        "_type": "data",
+        "_id": "murex_20260507205014_lvappp03460_1341886_1_0000009",
+        "_score": null,
+        "_source": {
+          "header": {
+            "messageId": "murex_20260507205014_lvappp03460_1341886",
+            "businessId": "6350699",
+            "batchId": "murex_20260507205014_lvappp03460_1341886_1",
+            "sourceSystem": "murex",
+            "secondarySourceSystem": null,
+            "sourceSystemCreationTimestamp": "2026-05-08T00:51:26",
+            "sentBy": "murex",
+            "sentTo": "SA",
+            "messageType": "Trade",
+            "schemaVersion": "1.168",
+            "processing": "EOD",
+            "businessDateTime": null,
+            "recordOffset": null
+          },
+          "trade": {
+            "tradeHeader": {
+              "scotiaUPI": "ForeignExchange:SimpleExotic:Barrier",
+              "assetClass": "NonCash-ForeignExchange-SimpleExotic-Barrier",
+              "algoProductCategory": null,
+              "isInternalDeal": false,
+              "isTradingBook": true,
+              "isXVA": "Y",
+              "tradeDate": "2024-10-04",
+              "entryDateTime": "2025-02-15T00:41:00.226Z",
+              "executionDateTime": {},
+              "originalExecutionDateTime": null,
+              "tradeUpdateDateTime": "2025-02-15T00:41:00.226Z",
+              "latestEventDateTime": null,
+              "tradeAssignmentDate": "2025-02-14",
+              "tradeStatus": "LIVE",
+              "tradeEvent": "Update",
+              "tradeSubEvent": null,
+              "tradeEventReasonCode": "PORTFOLIO_MODIFICATION",
+              "sourceSystemEventDescription": null,
+              "tradeTenorCount": null,
+              "region": null,
+              "isIntentToDeliver": "NotApplicable",
+              "facilityId": null,
+              "orderEntryType": "Unknown",
+              "sourceSystemProductId": {},
+              "masteredProductId": null,
+              "csaEligible": false,
+              "isPartOfPortfolioCompression": null,
+              "tradeIdentifiers": {
+                "tradeId": {
+                  "id": "M1234567"
+                },
+                "tradePackageAmount": null,
+                "tradeAlternativePackageId": null
+              },
+              "messageSenderIdentifier": null,
+              "orderExpiryDateTime": null,
+              "venueInfo": {},
+              "persons": {},
+              "settlement": {},
+              "regulatory": {},
+              "memo": null,
+              "isOrderIndicator": null,
+              "isAxeTradeIndicator": null,
+              "isGridTradeIndicator": null
+            },
+            "book": {
+              "bookId": "ABCDEF",
+              "transitNumber": 28092,
+              "legalEntityName": "BNS CANADA",
+              "bookName": "NPV BOOK"
+            },
+            "masteredBook": null,
+            "parties": {},
+            "masteredLegalEntity": null,
+            "costsAndCharges": {},
+            "clearingInstructions": null,
+            "sourceSystemSpecific": {},
+            "endOfDayPosition": {}
+          }
+        }
+      },
+      {
+        "_index": "prod.master.murex.trade.eod.v1-000014",
+        "_type": "data",
+        "_id": "murex_dummy_000002",
+        "_score": null,
+        "_source": {
+          "header": {
+            "messageId": "murex_20260507205014_lvappp03460_1341886",
+            "businessId": "6350700",
+            "batchId": "murex_20260507205014_lvappp03460_1341886_1",
+            "sourceSystem": "murex",
+            "secondarySourceSystem": null,
+            "sourceSystemCreationTimestamp": "2026-05-08T00:51:26",
+            "sentBy": "murex",
+            "sentTo": "SA",
+            "messageType": "Trade",
+            "schemaVersion": "1.168",
+            "processing": "EOD",
+            "businessDateTime": null,
+            "recordOffset": null
+          },
+          "trade": {
+            "tradeHeader": {
+              "scotiaUPI": "ForeignExchange:SimpleExotic:Barrier",
+              "assetClass": "NonCash-ForeignExchange-SimpleExotic-Barrier",
+              "algoProductCategory": null,
+              "isInternalDeal": false,
+              "isTradingBook": false,
+              "isXVA": "Y",
+              "tradeDate": "2024-10-04",
+              "entryDateTime": "2025-02-15T00:41:00.226Z",
+              "executionDateTime": {},
+              "originalExecutionDateTime": null,
+              "tradeUpdateDateTime": "2025-02-15T00:41:00.226Z",
+              "latestEventDateTime": null,
+              "tradeAssignmentDate": "2025-02-14",
+              "tradeStatus": "LIVE",
+              "tradeEvent": "Update",
+              "tradeSubEvent": null,
+              "tradeEventReasonCode": "PORTFOLIO_MODIFICATION",
+              "sourceSystemEventDescription": null,
+              "tradeTenorCount": null,
+              "region": null,
+              "isIntentToDeliver": "NotApplicable",
+              "facilityId": null,
+              "orderEntryType": "Unknown",
+              "sourceSystemProductId": {},
+              "masteredProductId": null,
+              "csaEligible": false,
+              "isPartOfPortfolioCompression": null,
+              "tradeIdentifiers": {
+                "tradeId": {
+                  "id": "M7654321"
+                },
+                "tradePackageAmount": 1000000,
+                "tradeAlternativePackageId": "PKG-778"
+              },
+              "messageSenderIdentifier": null,
+              "orderExpiryDateTime": null,
+              "venueInfo": {},
+              "persons": {},
+              "settlement": {},
+              "regulatory": {},
+              "memo": null,
+              "isOrderIndicator": null,
+              "isAxeTradeIndicator": null,
+              "isGridTradeIndicator": null
+            },
+            "book": {
+              "bookId": "XYZ987",
+              "transitNumber": 65235,
+              "legalEntityName": "BNS LONDON",
+              "bookName": "TREASURY BOOK"
+            },
+            "masteredBook": null,
+            "parties": {},
+            "masteredLegalEntity": null,
+            "costsAndCharges": {},
+            "clearingInstructions": null,
+            "sourceSystemSpecific": {},
+            "endOfDayPosition": {}
+          }
+        }
+      }
+    ]
+  }
+}

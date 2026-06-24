@@ -1,0 +1,145 @@
+meta:
+  interface_name: CTRTrade
+  source_format: json
+  output: csv
+fields:
+  - name: DW_ID
+    label: "CTR Generated ID"
+    type: int
+    required: true
+    nullable: false
+    intermediate_mapping: "????"
+    source_file: "CTR Generated"
+    exception_level: ERROR
+    exception_message: "Mandatory CTR-generated identifier; write null and flag if it is not generated."
+    notes: "Intermediate mapping unresolved ('????') in spec — manual verification required. Source: CTR Generated. Exception_Info (R1,E):(R2,E). Numeric size truncated in image."
+  - name: TRADE_ID
+    label: "Trade ID"
+    type: str
+    required: true
+    nullable: false
+    intermediate_mapping: "missing CTR field"
+    source_file: "Trade File"
+    exception_level: ERROR
+    exception_message: "Mandatory; flag as error if the Trade ID is missing."
+    notes: "Rule: SSName + SourceTrade Id. Intermediate mapping 'missing CTR field' — manual verification required. Source: Trade File. Exception_Info (R1,E):(R2,E):(R3,E)."
+  - name: SOURCE_TRADE_ID
+    label: "Source Trade / Holding ID"
+    type: str
+    required: true
+    nullable: false
+    intermediate_mapping: "trade.tradeHeader.tradeIdentifiers.tradeId.id"
+    source_file: "Trade File"
+    exception_level: ERROR
+    exception_message: "Mandatory; flag as error if the source trade/holding ID is missing."
+    notes: "JSON: trade.tradeHeader.tradeIdentifiers.tradeId.id. Rule: Trade /Holding ID. Source: Trade File. Name reconstructed from truncated cell 'SOURCE_T...'."
+  - name: OWN_ENTITY_ID
+    label: "Own Entity ID"
+    type: str
+    required: true
+    nullable: false
+    intermediate_mapping: "external mapping"
+    source_file: ""
+    exception_level: ERROR
+    exception_message: "Mandatory; flag as error if own entity ID cannot be mapped."
+    notes: "External mapping — 'Map based on CTR_Inea_to_eGL' (external doc, URL truncated) — manual verification required. Sample 58149. Name reconstructed from 'OWN_ENT...'."
+  - name: BOOK_ID
+    label: "Book ID (Portfolio ID)"
+    type: str
+    required: false
+    nullable: true
+    intermediate_mapping: "trade.book.bookId"
+    source_file: "Trade File"
+    exception_level: ERROR
+    exception_message: "Conditionally mandatory; when required and missing, write null and flag."
+    notes: "Mandatory=C (conditional): 'Not required ...'. JSON: trade.book.bookId. Rule: Portfolio Id. Source: Trade File. Exception_Info (R1,E):(R2,W). Level ERROR derived from conditional-mandatory R1=E."
+  - name: BOOKING_POINT_ID
+    label: "Booking Point"
+    type: str
+    required: false
+    nullable: true
+    intermediate_mapping: "trade.book.transitNumber"
+    source_file: "Trade File"
+    exception_level: ERROR
+    exception_message: "Conditionally mandatory; required when all stated conditions are met — flag if missing then."
+    notes: "Mandatory=C: 'Required when ALL conditions are met'. JSON: trade.book.transitNumber. Rule: Booking Point. Source: Trade File. Name reconstructed from 'BOOKING_...'."
+  - name: BUSINESS_UNIT_NAME
+    label: "Business Unit Name"
+    type: str
+    required: true
+    nullable: false
+    intermediate_mapping: "external mapping"
+    source_file: "Trade File"
+    exception_level: ERROR
+    exception_message: "Mandatory; flag as error if the business unit cannot be mapped."
+    notes: "External mapping — 'Map based on CTR_Inea_to_eGL (Transit/...)' — manual verification required. Sample 'BNS Cana...'. Name reconstructed from 'BUSINESS_...'."
+  - name: TRANSIT_NUMBER
+    label: "Transit Number"
+    type: int
+    required: true
+    nullable: false
+    intermediate_mapping: "trade.book.transitNumber"
+    source_file: "Trade File"
+    exception_level: ERROR
+    exception_message: "Mandatory; flag as error if the transit number is missing."
+    notes: "JSON: trade.book.transitNumber. Rule: Transit Number. Source: Trade File. Exception_Info (R1,E):(R2,W):(R7,W). Name reconstructed from 'TRANSIT_...'."
+  - name: EGL_DEPARTMENT
+    label: "eGL Department"
+    type: str
+    required: false
+    nullable: true
+    intermediate_mapping: "external mapping"
+    source_file: "Trade File"
+    exception_level: ERROR
+    exception_message: "Conditionally mandatory; required when all stated conditions are met — flag if missing then."
+    notes: "Mandatory=C: 'Required when ALL conditions are met'. External mapping — CTR_Inea_to_eGL (Transit/...) — manual verification required. Sample 'NPV book'. Name reconstructed from 'EGL_DEPA...'."
+  - name: EGL_LOCATION
+    label: "eGL Location"
+    type: str
+    required: false
+    nullable: true
+    intermediate_mapping: "external mapping"
+    source_file: "Trade File"
+    exception_level: ERROR
+    exception_message: "Conditionally mandatory; required when all stated conditions are met — flag if missing then."
+    notes: "Mandatory=C: 'Required when ALL conditions are met'. External mapping — CTR_Inea_to_eGL (Transit/...) — manual verification required. Sample 'Caribbean'. Name reconstructed from 'EGL_LOCA...'."
+  - name: EGL_PRODUCT
+    label: "eGL Product"
+    type: str
+    required: false
+    nullable: true
+    intermediate_mapping: "external mapping"
+    source_file: "Trade File"
+    exception_level: ERROR
+    exception_message: "Conditionally mandatory; not required for Loanet, otherwise flag if missing."
+    notes: "Mandatory=C: 'Not required for Loanet, Else ...'. External mapping — CTR_Inea_to_eGL (Account/...) — manual verification required. Sample 'Bonds'. Name reconstructed from 'EGL_PROD...'."
+  - name: INVESTMENT_TRADING_FLAG
+    label: "Investment / Trading Flag"
+    type: code
+    required: true
+    nullable: false
+    intermediate_mapping: "trade.tradeHeader.isTradingBook"
+    source_file: "Trade File"
+    exception_level: ERROR
+    exception_message: "Mandatory flag; flag as error if the Trading indicator is missing."
+    notes: "Allowed values T, I (from sample). Rule (truncated): if [Trading] is 'TRUE' populate 'T' (else 'I'). Intermediate: Trading field is from trade.tradeHeader.isTradingBook. Source: Trade File."
+  - name: BANKING_BOOK_QUALIFYING_FLAG
+    label: "Banking Book Qualifying Flag"
+    type: code
+    required: false
+    nullable: true
+    intermediate_mapping: "????"
+    source_file: "Trade File"
+    exception_level: WARNING
+    exception_message: "Optional flag; non-blocking, written as-is and flagged in the issues log."
+    notes: "Allowed values Y, N (from sample). Intermediate mapping unresolved ('????') and Mapping_Rule truncated in image — manual verification required. Source: Trade File."
+  - name: SOURCE_SYSTEM
+    label: "Source System"
+    type: code
+    required: true
+    nullable: false
+    intermediate_mapping: "MUREXSA"
+    source_file: "Trade File"
+    exception_level: ERROR
+    exception_message: "Mandatory; flag as error if the source system is not set."
+    notes: "Constrained source-system code. Intermediate mapping value 'MUREXSA'; sample 'K2'. Rule: Source System. Source: Trade File. Name reconstructed from 'SOURCE_S...'."
