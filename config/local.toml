@@ -2,22 +2,30 @@
 environment = "local"
 
 [kafka]
-bootstrap_servers = ["localhost:9092"]
 topic = "control-topic"
-group_id = "etl-local"
-client_id = "etl-control-consumer-local"
-auto_offset_reset = "earliest"
-enable_auto_commit = true
-security_protocol = "PLAINTEXT"
-max_poll_interval_ms = 900000
+value_schema_file = "samples/control_message.avsc"
+
+# Shared connection + security properties (literal confluent-kafka / librdkafka names).
+[kafka.client]
+"bootstrap.servers" = "localhost:9092"
+"client.id" = "etl-control-local"
+"security.protocol" = "PLAINTEXT"
+
+# Consumer-only librdkafka properties (merged onto [kafka.client]).
+[kafka.consumer]
+"group.id" = "etl-local"
+"auto.offset.reset" = "earliest"
+"enable.auto.commit" = true
+
+[schema_registry]
+"url" = "http://localhost:8081"
 
 [consumer]
 output_dir = "data/converted"
 trigger_next = true
 next_command = ["python", "-m", "etl.es_lookup"]
-batch_max_records = 100
-batch_interval_seconds = 600
-poll_timeout_ms = 1000
+max_messages = 100
+poll_timeout_seconds = 10.0
 
 [message]
 id_attribute = "event_id"

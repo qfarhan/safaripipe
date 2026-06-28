@@ -1,5 +1,6 @@
 elasticsearch<9,>=8.13
-kafka-python<3,>=2.0.2
+confluent-kafka[avro]<3,>=2.4
 
 [dev]
 pytest<9,>=8
+fastavro>=1.9

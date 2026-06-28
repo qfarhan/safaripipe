@@ -1,5 +1,12 @@
 # Build Kafka Codex ETL From Scratch — A Test-Driven Walkthrough
 
+> **Heads-up:** this tutorial describes the original `kafka-python` + JSON design of the
+> Kafka clients. The project has since moved to `confluent-kafka` + Avro / Schema Registry
+> (and supports Kerberos SASL/GSSAPI). The methodology below still holds, but the consumer/
+> producer code, config shape, and `docker-compose.yml` differ from the current source. See
+> the README and [`real-world-kerberos-avro.md`](real-world-kerberos-avro.md) for the
+> current architecture.
+
 This tutorial rebuilds the entire `kafka-codex` project from an empty directory,
 **one verifiable checkpoint at a time**. The rule we follow throughout:
 
@@ -1861,3 +1868,373 @@ fails, you fix it before writing the next line.
 
 When you can run `pytest -q` (7 passed) and `bootstrap_e2e_docker.sh` (a live hit) on a
 clean checkout, you have faithfully rebuilt the project.
+
+---
+
+## Stage 14 — Kerberos (SASL/GSSAPI) authentication (optional)
+
+> This stage reflects the **current** repo (the Kerberos overlay and the
+> `confluent-kafka` client config). It is an add-on: nothing above changes, and the
+> default stack stays `PLAINTEXT`. You flip Kerberos on with a single line in `.env`.
+
+So far the broker is wide open (`PLAINTEXT`). Production Kafka almost always requires
+authentication, and the common enterprise mechanism is **Kerberos** via SASL/GSSAPI. We
+add it as a *toggleable overlay* so the plaintext path you built and tested still works
+untouched.
+
+The design decisions, up front (they shape every file below):
+
+1. **Toggle, don't fork.** The base `docker-compose.yml` stays plaintext. A second file,
+   `docker-compose.kerberos.yml`, *overrides* the broker and adds a KDC. You select it with
+   the `COMPOSE_FILE` variable in `.env`, so `docker compose up -d` alone picks the right
+   stack — no `-f` juggling, no edits to the base file.
+2. **Authenticate clients only.** The broker exposes two listeners: `HOST` (advertised
+   `localhost:9092`) becomes `SASL_PLAINTEXT/GSSAPI`; `INTERNAL` (advertised `kafka:29092`)
+   stays `PLAINTEXT` for inter-broker traffic and Schema Registry. That keeps the JAAS
+   surface minimal — only external clients log in.
+3. **Self-contained KDC.** A small MIT Kerberos container mints the broker + client
+   keytabs onto a shared volume; the broker waits on its health before starting.
+
+### 14.1 The realm config — `kerberos/krb5.conf`
+
+Every Kerberos participant (KDC, broker, clients) reads a `krb5.conf` that names the realm
+and locates the KDC:
+
+```ini
+[libdefaults]
+    default_realm = EXAMPLE.COM
+    dns_lookup_realm = false
+    dns_lookup_kdc = false
+    rdns = false
+    udp_preference_limit = 1          # force TCP; container UDP can fragment
+    default_ccache_name = /tmp/krb5cc_%{uid}
+
+[realms]
+    EXAMPLE.COM = {
+        kdc = kdc
+        admin_server = kdc
+    }
+
+[domain_realm]
+    .localhost = EXAMPLE.COM          # broker advertises "localhost" -> map it
+    localhost = EXAMPLE.COM
+```
+
+The two things that matter most: `kdc = kdc` (the KDC is reachable at the compose service
+name `kdc`), and the `domain_realm` mapping for `localhost` — because the broker advertises
+`localhost`, the client derives the Service Principal Name `kafka/localhost@EXAMPLE.COM`.
+
+### 14.2 The KDC image — `kerberos/Dockerfile.kdc` + `kerberos/kdc-entrypoint.sh`
+
+The KDC is a tiny Debian image with MIT Kerberos installed:
+
+```dockerfile
+FROM debian:bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends krb5-kdc krb5-admin-server krb5-user \
+    && rm -rf /var/lib/apt/lists/*
+COPY kdc-entrypoint.sh /usr/local/bin/kdc-entrypoint.sh
+RUN chmod +x /usr/local/bin/kdc-entrypoint.sh
+EXPOSE 88/udp 88/tcp 749/tcp
+ENTRYPOINT ["/usr/local/bin/kdc-entrypoint.sh"]
+```
+
+The entrypoint creates the realm database, adds the principals, exports their keytabs to a
+shared volume, then runs the KDC in the foreground:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+REALM="${KRB5_REALM:-EXAMPLE.COM}"
+KDC_PASSWORD="${KRB5_KDC_PASSWORD:-masterkey}"
+
+# "<principal>:<keytab-path>"
+PRINCIPALS=(
+  "kafka/localhost:/keytabs/kafka.keytab"   # broker service principal (SPN)
+  "client:/keytabs/client.keytab"           # an example client identity
+)
+
+mkdir -p /etc/krb5kdc /keytabs /var/lib/krb5kdc
+cat > /etc/krb5kdc/kdc.conf <<EOF
+[kdcdefaults]
+    kdc_ports = 88
+    kdc_tcp_ports = 88
+[realms]
+    ${REALM} = {
+        acl_file = /etc/krb5kdc/kadm5.acl
+        max_renewable_life = 7d 0h 0m 0s
+        supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal
+        default_principal_flags = +preauth
+    }
+EOF
+echo "*/admin@${REALM} *" > /etc/krb5kdc/kadm5.acl
+
+# DB_FRESH drives keytab overwrite: a freshly created DB has new keys, so any
+# keytab left on the shared volume from a previous DB is stale and must be re-exported.
+DB_FRESH=0
+if [ ! -f /var/lib/krb5kdc/principal ]; then
+    kdb5_util create -s -r "${REALM}" -P "${KDC_PASSWORD}"
+    DB_FRESH=1
+fi
+
+for entry in "${PRINCIPALS[@]}"; do
+    principal="${entry%%:*}"; keytab="${entry##*:}"
+    # kadmin.local exits 0 even on a failed query, so match against listprincs.
+    if ! kadmin.local -q "listprincs" 2>/dev/null | grep -qx "${principal}@${REALM}"; then
+        kadmin.local -q "addprinc -randkey ${principal}"
+    fi
+    if [ "${DB_FRESH}" = "1" ] || [ ! -f "${keytab}" ]; then
+        rm -f "${keytab}"
+        # -norandkey extracts the *current* key (no rotation) so the broker's
+        # keytab always matches the live DB.
+        kadmin.local -q "ktadd -k ${keytab} -norandkey ${principal}"
+    fi
+    chmod 644 "${keytab}"           # world-readable for the non-root Kafka user
+done
+
+exec krb5kdc -n                    # foreground -> logs to stdout
+```
+
+Two subtleties worth internalizing, both learned the hard way:
+
+- **`DB_FRESH` + `-norandkey`.** The KDC database persists on a volume. If you ever recreate
+  the DB but keep an old keytab, the keys won't match (`Server not found in Kerberos
+  database` / decrypt failures). Forcing a re-export on a fresh DB, and extracting with
+  `-norandkey` (which does *not* rotate the key), keeps the broker keytab and the live DB in
+  lockstep.
+- **World-readable keytabs.** The KDC runs as root; the Kafka container runs as a non-root
+  user. `chmod 644` lets the broker read its keytab off the shared volume.
+
+### 14.3 The JAAS logins — `kerberos/kafka_jaas.conf` + `kerberos/client_jaas.conf`
+
+The broker logs in as its service principal (the `KafkaServer` entry); CLI clients log in as
+the client principal (the `KafkaClient` entry). Both use `useKeyTab` so there is **no
+password and no `kinit`** — `Krb5LoginModule` gets the ticket straight from the keytab:
+
+```jaas
+// kerberos/kafka_jaas.conf  (broker)
+KafkaServer {
+    com.sun.security.auth.module.Krb5LoginModule required
+    useKeyTab=true
+    storeKey=true
+    keyTab="/etc/kafka/keytabs/kafka.keytab"
+    principal="kafka/localhost@EXAMPLE.COM";
+};
+```
+
+```jaas
+// kerberos/client_jaas.conf  (CLI clients)
+KafkaClient {
+    com.sun.security.auth.module.Krb5LoginModule required
+    useKeyTab=true
+    storeKey=true
+    keyTab="/etc/kafka/keytabs/client.keytab"
+    principal="client@EXAMPLE.COM";
+};
+```
+
+Note the keytab path `/etc/kafka/keytabs/...` — that is where the shared keytab volume is
+mounted inside the Kafka container (next step).
+
+### 14.4 The compose overlay — `docker-compose.kerberos.yml`
+
+This file does three things: adds the `kdc` service, makes the broker wait for it, and
+flips the `HOST` listener to SASL/GSSAPI:
+
+```yaml
+services:
+  kdc:
+    build: { context: ./kerberos, dockerfile: Dockerfile.kdc }
+    container_name: kafka-codex-kdc
+    hostname: kdc
+    environment:
+      KRB5_REALM: "EXAMPLE.COM"
+      KRB5_KDC_PASSWORD: "masterkey"
+    ports: ["88:88/udp", "88:88/tcp"]
+    volumes:
+      - ./kerberos/krb5.conf:/etc/krb5.conf:ro
+      - kerberos-keytabs:/keytabs
+      - kerberos-kdcdb:/var/lib/krb5kdc
+    healthcheck:                       # healthy only once both keytabs exist
+      test: ["CMD-SHELL", "test -f /keytabs/kafka.keytab && test -f /keytabs/client.keytab"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  kafka:
+    depends_on:
+      kdc: { condition: service_healthy }
+    environment:
+      KAFKA_LISTENERS: "HOST://0.0.0.0:9092,INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "HOST://localhost:9092,INTERNAL://kafka:29092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,HOST:SASL_PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_SASL_ENABLED_MECHANISMS: "GSSAPI"
+      KAFKA_SASL_KERBEROS_SERVICE_NAME: "kafka"
+      # JVM-level (not server.properties): the broker's static JAAS + the realm config.
+      KAFKA_OPTS: "-Djava.security.krb5.conf=/etc/kafka/kerberos/krb5.conf -Djava.security.auth.login.config=/etc/kafka/kerberos/kafka_jaas.conf"
+    volumes:
+      - ./kerberos:/etc/kafka/kerberos:ro
+      - kerberos-keytabs:/etc/kafka/keytabs:ro
+
+volumes:
+  kerberos-keytabs:
+  kerberos-kdcdb:
+```
+
+Key points:
+
+- **Only `HOST` is SASL.** The protocol map keeps `INTERNAL` and `CONTROLLER` on `PLAINTEXT`,
+  so Schema Registry (which talks to `kafka:29092`) and inter-broker traffic never need
+  Kerberos. The static `KafkaServer` JAAS is used by the one SASL listener.
+- **`KAFKA_OPTS`, not env-translated JAAS.** Per-listener JAAS via env var is fragile because
+  the apache/kafka image mangles the underscore in the listener name `SASL_PLAINTEXT`. A
+  static JAAS file passed through `KAFKA_OPTS` sidesteps that entirely.
+- **`depends_on: service_healthy`** ties broker startup to the keytab being present.
+
+### 14.5 The toggle — `.env.example`
+
+`docker compose` reads `.env` automatically and honours `COMPOSE_FILE`:
+
+```bash
+# ---- Kerberos OFF (default: plaintext Kafka) ----
+COMPOSE_FILE=docker-compose.yml
+
+# ---- Kerberos ON (SASL/GSSAPI Kafka + KDC) ----
+#COMPOSE_FILE=docker-compose.yml:docker-compose.kerberos.yml
+```
+
+`cp .env.example .env`, uncomment one line, and every `docker compose` command targets the
+stack you chose. (On native Windows the path separator is `;`.)
+
+### 14.6 Bring it up
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.kerberos.yml up -d --build
+# ...or, with .env set to the Kerberos line: docker compose up -d --build
+```
+
+**Checkpoint 14a** — the KDC reaches `healthy` (keytabs exported) and the broker logged in:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.kerberos.yml ps
+docker logs kafka-codex-kafka 2>&1 | grep -i "TGT valid"
+```
+
+Expected — the broker obtained a ticket-granting ticket as its service principal:
+
+```text
+INFO [Principal=kafka/localhost@EXAMPLE.COM]: TGT valid starting at: ...
+```
+
+> **If the KDC exits with `Can not fetch master key`** or the broker logs
+> `Server kafka/localhost@EXAMPLE.COM not found in Kerberos database`, you have a stale
+> keytab/DB volume from an earlier run. Wipe them and rebuild:
+> ```bash
+> docker rm -f kafka-codex-kafka kafka-codex-kdc
+> docker volume rm kafka-codex_kerberos-kdcdb kafka-codex_kerberos-keytabs
+> docker compose -f docker-compose.yml -f docker-compose.kerberos.yml up -d --build
+> ```
+
+### 14.7 Prove the auth handshake — `scripts/verify_kerberos_broker.sh`
+
+The cleanest live proof runs the Kafka console tools **inside** the broker container. Why
+in-container? Two reasons: (1) inside the container `localhost:9092` *is* the SASL listener,
+so there is no advertised-address puzzle; (2) it avoids the host's `librdkafka`, whose
+prebuilt wheel usually lacks GSSAPI (see the caveat in 14.8). The client logs in from
+`client.keytab` — no `kinit`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+KAFKA_CONTAINER="${KAFKA_CONTAINER:-kafka-codex-kafka}"
+TOPIC="${TOPIC:-krb-smoke}"
+CLIENT_OPTS="-Djava.security.auth.login.config=/etc/kafka/kerberos/client_jaas.conf -Djava.security.krb5.conf=/etc/kafka/kerberos/krb5.conf"
+
+docker exec -i -e KAFKA_OPTS="${CLIENT_OPTS}" "${KAFKA_CONTAINER}" \
+  bash -c "echo 'hello-kerberos' | /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server localhost:9092 --topic '${TOPIC}' \
+    --producer-property security.protocol=SASL_PLAINTEXT \
+    --producer-property sasl.mechanism=GSSAPI \
+    --producer-property sasl.kerberos.service.name=kafka"
+
+docker exec -e KAFKA_OPTS="${CLIENT_OPTS}" "${KAFKA_CONTAINER}" \
+  /opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server localhost:9092 --topic "${TOPIC}" \
+    --from-beginning --timeout-ms 15000 --max-messages 1 \
+    --consumer-property security.protocol=SASL_PLAINTEXT \
+    --consumer-property sasl.mechanism=GSSAPI \
+    --consumer-property sasl.kerberos.service.name=kafka
+```
+
+Note `KAFKA_OPTS` is overridden in the `exec` to point at the **client** JAAS (the container
+env points at the *server* JAAS). The client principal `client@EXAMPLE.COM` gets a TGT from
+the keytab, requests a service ticket for `kafka/localhost@EXAMPLE.COM`, and the broker
+accepts it.
+
+**Checkpoint 14b** — round-trip a message over GSSAPI:
+
+```bash
+./scripts/verify_kerberos_broker.sh
+```
+
+Expected (the message comes back, proving authenticated produce *and* consume):
+
+```text
+[verify] producing 'hello-kerberos' to 'krb-smoke' over SASL_PLAINTEXT/GSSAPI...
+[verify] consuming it back over SASL_PLAINTEXT/GSSAPI...
+hello-kerberos
+Processed a total of 1 messages
+[verify] OK: broker authenticated the GSSAPI client and round-tripped a message.
+```
+
+### 14.8 Point the ETL at Kerberos — `config/local-kerberos.toml`
+
+The Python client config simply carries the native librdkafka SASL properties under
+`[kafka.client]` (this is the `confluent-kafka` shape the current code uses):
+
+```toml
+[kafka.client]
+"bootstrap.servers" = "localhost:9092"
+"security.protocol" = "SASL_PLAINTEXT"
+"sasl.mechanism" = "GSSAPI"
+"sasl.kerberos.service.name" = "kafka"
+"sasl.kerberos.principal" = "client@EXAMPLE.COM"
+"sasl.kerberos.keytab" = "kerberos/keytabs/client.keytab"
+```
+
+Run it with `--env local-kerberos`:
+
+```bash
+python -m etl.kafka_consumer --env local-kerberos --once
+```
+
+> **Caveat — the host wheel usually can't do GSSAPI.** confluent-kafka's prebuilt wheels
+> often bundle a `librdkafka` built **without** GSSAPI. The symptom is
+> `No provider for SASL mechanism GSSAPI`, or, as observed on this machine,
+> `Property not available: "sasl.kerberos.keytab"`. To run the *Python* client over GSSAPI
+> you need a `librdkafka` built with SASL/GSSAPI (a Linux container, or a source rebuild).
+> The **broker** path is fully verified by Checkpoint 14b regardless. The production
+> transport (`config/prod.toml`) is the same config with `security.protocol = "SASL_SSL"`
+> plus an `ssl.ca.location` truststore.
+
+### 14.9 Tear back down to plaintext
+
+```bash
+docker compose up -d --remove-orphans      # base stack only; drops the KDC
+```
+
+### Kerberos testing strategy
+
+| Layer | What | How verified |
+|---|---|---|
+| KDC bootstrap | realm + principals + keytabs | Checkpoint 14a (`kdc` healthy) |
+| Broker login | service-principal keytab + JAAS + krb5 | Checkpoint 14a (`TGT valid` in broker log) |
+| Client auth | GSSAPI produce + consume | Checkpoint 14b (`verify_kerberos_broker.sh`) |
+| ETL over GSSAPI | native librdkafka props | config in place; needs GSSAPI-enabled `librdkafka` (14.8) |
+
+The same discipline as the rest of the tutorial: each Kerberos layer has a checkpoint that
+proves it before you rely on the next one.

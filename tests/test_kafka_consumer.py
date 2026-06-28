@@ -1,98 +1,127 @@
 from types import SimpleNamespace
 
+import pytest
+
 from etl import kafka_consumer
 
 
-def test_flatten_polled_records_returns_messages_in_partition_order():
-    first = SimpleNamespace(value={"event_id": "one"})
-    second = SimpleNamespace(value={"event_id": "two"})
+class FakeMessage:
+    """Duck-types the confluent_kafka.Message methods the consumer uses."""
 
-    assert kafka_consumer.flatten_polled_records({"partition-0": [first], "partition-1": [second]}) == [
-        first,
-        second,
-    ]
+    def __init__(self, value, *, topic="control-topic", partition=0, offset=0, key=b"k", ts=(1, 123)):
+        self._value = value
+        self._topic = topic
+        self._partition = partition
+        self._offset = offset
+        self._key = key
+        self._ts = ts
+
+    def error(self):
+        return None
+
+    def value(self):
+        return self._value
+
+    def topic(self):
+        return self._topic
+
+    def partition(self):
+        return self._partition
+
+    def offset(self):
+        return self._offset
+
+    def key(self):
+        return self._key
+
+    def timestamp(self):
+        return self._ts
 
 
-def test_resolve_batch_options_defaults_to_ten_minute_interval():
-    max_records, interval_seconds, poll_timeout_ms = kafka_consumer.resolve_batch_options(
-        {},
-        batch_max_records=None,
-        batch_interval_seconds=None,
-        poll_timeout_ms=None,
+def test_resolve_consume_options_defaults():
+    assert kafka_consumer.resolve_consume_options(
+        {}, max_messages=None, poll_timeout_seconds=None
+    ) == (100, 10.0)
+
+
+def test_resolve_consume_options_reads_config_and_validates():
+    assert kafka_consumer.resolve_consume_options(
+        {"max_messages": 5, "poll_timeout_seconds": 2.0},
+        max_messages=None,
+        poll_timeout_seconds=None,
+    ) == (5, 2.0)
+    with pytest.raises(ValueError):
+        kafka_consumer.resolve_consume_options({}, max_messages=None, poll_timeout_seconds=0)
+
+
+def test_message_metadata_adapts_confluent_message():
+    meta = kafka_consumer.message_metadata(
+        FakeMessage({"event_id": "x"}, partition=2, offset=7, key=b"customer-9", ts=(1, 999))
     )
+    assert meta == {
+        "topic": "control-topic",
+        "partition": 2,
+        "offset": 7,
+        "timestamp": 999,
+        "key": "customer-9",
+    }
 
-    assert max_records == 100
-    assert interval_seconds == 600
-    assert poll_timeout_ms == 1000
+
+def test_message_metadata_handles_unavailable_timestamp_and_null_key():
+    meta = kafka_consumer.message_metadata(FakeMessage({}, key=None, ts=(0, -1)))
+    assert meta["timestamp"] is None
+    assert meta["key"] is None
 
 
-def test_consume_messages_waits_between_non_empty_batches(monkeypatch):
-    first = SimpleNamespace(
-        value={"event_id": "one"},
-        topic="control-topic",
-        partition=0,
-        offset=0,
-        timestamp=1,
-        key=b"one",
+def test_output_path_uses_id_value_and_message_id(tmp_path):
+    path = kafka_consumer.output_path(
+        tmp_path, {"message_id": "mid", "id_value": "a/b"}
     )
-    second = SimpleNamespace(
-        value={"event_id": "two"},
-        topic="control-topic",
-        partition=0,
-        offset=1,
-        timestamp=2,
-        key=b"two",
-    )
+    # the slash in the id must be sanitized so it does not create a subdirectory
+    assert path.name == "a_b-mid.json"
+
+
+def test_consume_messages_deserializes_and_stops_on_drain(monkeypatch):
+    polled = [FakeMessage({"event_id": "one"}), FakeMessage({"event_id": "two"}), None]
 
     class FakeConsumer:
         def __init__(self):
-            self.poll_calls = 0
+            self.subscribed = None
             self.closed = False
+            self._it = iter(polled)
 
-        def poll(self, *, timeout_ms, max_records):
-            self.poll_calls += 1
-            assert timeout_ms == 25
-            assert max_records == 1
-            if self.poll_calls == 1:
-                return {"partition-0": [first]}
-            if self.poll_calls == 2:
-                return {"partition-0": [second]}
-            raise AssertionError("test should only poll two batches")
+        def subscribe(self, topics):
+            self.subscribed = topics
+
+        def poll(self, timeout):
+            return next(self._it)
 
         def close(self):
             self.closed = True
 
-    fake_consumer = FakeConsumer()
-    sleeps: list[float] = []
-    monotonic_values = iter([0.0, 1.0, 600.0])
+    fake = FakeConsumer()
 
     monkeypatch.setattr(
         kafka_consumer,
         "load_config",
         lambda env: SimpleNamespace(
-            kafka={},
-            consumer={"batch_max_records": 1, "batch_interval_seconds": 600, "poll_timeout_ms": 25},
+            kafka={"topic": "control-topic", "client": {}, "consumer": {}},
+            schema_registry={"url": "http://sr"},
+            consumer={"max_messages": 0, "poll_timeout_seconds": 1.0},
         ),
     )
-    monkeypatch.setattr(kafka_consumer, "create_kafka_consumer", lambda kafka_config: fake_consumer)
+    monkeypatch.setattr(kafka_consumer, "create_kafka_consumer", lambda cfg: fake)
+    monkeypatch.setattr(kafka_consumer, "create_schema_registry_client", lambda cfg: object())
+    # Fake Avro deserializer: the FakeMessage already carries a dict value.
+    monkeypatch.setattr(kafka_consumer, "create_avro_deserializer", lambda sr: (lambda value, ctx: value))
     monkeypatch.setattr(
-        kafka_consumer,
-        "process_payload",
-        lambda **kwargs: {"payload": kwargs["payload"], "metadata": kwargs["kafka_metadata"]},
-    )
-    monkeypatch.setattr(kafka_consumer.time, "monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr(kafka_consumer.time, "sleep", sleeps.append)
-
-    results = kafka_consumer.consume_messages(
-        env="local",
-        once=False,
-        trigger_next=None,
-        dry_run_next=False,
+        kafka_consumer, "process_payload", lambda **kw: {"payload": kw["payload"], "meta": kw["kafka_metadata"]}
     )
 
-    assert next(results)["payload"] == {"event_id": "one"}
-    assert sleeps == []
-    assert next(results)["payload"] == {"event_id": "two"}
-    assert sleeps == [599.0]
-    results.close()
-    assert fake_consumer.closed is True
+    results = list(
+        kafka_consumer.consume_messages(env="local", once=True, trigger_next=None, dry_run_next=False)
+    )
+
+    assert [r["payload"] for r in results] == [{"event_id": "one"}, {"event_id": "two"}]
+    assert fake.subscribed == ["control-topic"]
+    assert fake.closed is True

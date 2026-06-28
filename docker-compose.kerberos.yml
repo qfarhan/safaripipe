@@ -1,0 +1,67 @@
+# Optional Kerberos (SASL/GSSAPI) overlay for Kafka.
+#
+# This file is an *override* layered on top of docker-compose.yml. It is OFF by
+# default. Turn it on by pointing COMPOSE_FILE at both files (see .env.example):
+#
+#   # Kerberos OFF (plaintext):
+#   docker compose up -d
+#
+#   # Kerberos ON:
+#   docker compose -f docker-compose.yml -f docker-compose.kerberos.yml up -d
+#   # ...or set COMPOSE_FILE in .env and just run `docker compose up -d`.
+#
+# What it changes:
+#   * adds a `kdc` service (MIT Kerberos) that mints the broker + client keytabs
+#   * switches only the HOST client listener (9092) to SASL_PLAINTEXT/GSSAPI
+#   * leaves the INTERNAL listener (kafka:29092) PLAINTEXT, so inter-broker traffic
+#     and Schema Registry keep working without Kerberos — minimal JAAS surface.
+services:
+  kdc:
+    build:
+      context: ./kerberos
+      dockerfile: Dockerfile.kdc
+    container_name: kafka-codex-kdc
+    hostname: kdc
+    environment:
+      KRB5_REALM: "EXAMPLE.COM"
+      KRB5_KDC_PASSWORD: "masterkey"
+    ports:
+      - "88:88/udp"
+      - "88:88/tcp"
+    volumes:
+      - ./kerberos/krb5.conf:/etc/krb5.conf:ro
+      - kerberos-keytabs:/keytabs
+      - kerberos-kdcdb:/var/lib/krb5kdc
+    healthcheck:
+      # Healthy only once both keytabs have been exported to the shared volume.
+      # Kafka waits on this, so it never starts before its keytab exists.
+      test: ["CMD-SHELL", "test -f /keytabs/kafka.keytab && test -f /keytabs/client.keytab"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  kafka:
+    depends_on:
+      kdc:
+        condition: service_healthy
+    environment:
+      # HOST (client) listener = SASL_PLAINTEXT/GSSAPI; INTERNAL stays PLAINTEXT for
+      # inter-broker + Schema Registry; controller stays PLAINTEXT on 9093.
+      KAFKA_LISTENERS: "HOST://0.0.0.0:9092,INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "HOST://localhost:9092,INTERNAL://kafka:29092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,HOST:SASL_PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_SASL_ENABLED_MECHANISMS: "GSSAPI"
+      KAFKA_SASL_KERBEROS_SERVICE_NAME: "kafka"
+      # KAFKA_OPTS is JVM-level (not written to server.properties). It supplies the
+      # broker's static JAAS (service-principal keytab login) and the krb5 realm config.
+      KAFKA_OPTS: "-Djava.security.krb5.conf=/etc/kafka/kerberos/krb5.conf -Djava.security.auth.login.config=/etc/kafka/kerberos/kafka_jaas.conf"
+    volumes:
+      - ./kerberos:/etc/kafka/kerberos:ro
+      # Keytabs live at /etc/kafka/keytabs (referenced by the JAAS files).
+      - kerberos-keytabs:/etc/kafka/keytabs:ro
+
+volumes:
+  kerberos-keytabs:
+  kerberos-kdcdb:

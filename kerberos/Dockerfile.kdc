@@ -1,0 +1,19 @@
+# Minimal MIT Kerberos KDC for local Kafka SASL/GSSAPI testing.
+# Self-contained: builds the principal database and exports keytabs on first boot,
+# then runs krb5kdc in the foreground.
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        krb5-kdc krb5-admin-server krb5-user \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY kdc-entrypoint.sh /usr/local/bin/kdc-entrypoint.sh
+RUN chmod +x /usr/local/bin/kdc-entrypoint.sh
+
+# 88 = KDC, 749 = kadmin. Keytabs land in /keytabs (a shared volume with Kafka).
+EXPOSE 88/udp 88/tcp 749/tcp
+
+ENTRYPOINT ["/usr/local/bin/kdc-entrypoint.sh"]

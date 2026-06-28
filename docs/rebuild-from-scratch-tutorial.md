@@ -1,5 +1,10 @@
 # Rebuild The Kafka Codex ETL From Scratch
 
+> **Heads-up:** this walkthrough reflects the original `kafka-python` + JSON design. The
+> Kafka clients have since moved to `confluent-kafka` + Avro / Schema Registry with optional
+> Kerberos (SASL/GSSAPI). The README and [`real-world-kerberos-avro.md`](real-world-kerberos-avro.md)
+> describe the current architecture.
+
 This tutorial teaches the codebase by rebuilding it from an empty directory into the current ETL project.
 
 The final project has two independent Python components:

@@ -1,0 +1,17 @@
+{
+  "type": "record",
+  "name": "ControlMessage",
+  "namespace": "etl.control",
+  "doc": "Canonical control message published to the Kafka control topic.",
+  "fields": [
+    {"name": "event_id", "type": "string", "doc": "Primary key promoted to id_value."},
+    {"name": "event_type", "type": "string"},
+    {"name": "source_index", "type": ["null", "string"], "default": null},
+    {"name": "published_at", "type": ["null", "string"], "default": null},
+    {
+      "name": "attributes",
+      "type": {"type": "map", "values": "string"},
+      "default": {}
+    }
+  ]
+}

@@ -2,22 +2,28 @@
 environment = "dev"
 
 [kafka]
-bootstrap_servers = ["dev-kafka-1:9092", "dev-kafka-2:9092"]
 topic = "control-topic"
-group_id = "etl-dev"
-client_id = "etl-control-consumer-dev"
-auto_offset_reset = "latest"
-enable_auto_commit = true
-security_protocol = "PLAINTEXT"
-max_poll_interval_ms = 900000
+value_schema_file = "samples/control_message.avsc"
+
+[kafka.client]
+"bootstrap.servers" = "dev-kafka-1:9092,dev-kafka-2:9092"
+"client.id" = "etl-control-dev"
+"security.protocol" = "PLAINTEXT"
+
+[kafka.consumer]
+"group.id" = "etl-dev"
+"auto.offset.reset" = "latest"
+"enable.auto.commit" = true
+
+[schema_registry]
+"url" = "http://dev-schema-registry:8081"
 
 [consumer]
 output_dir = "data/converted"
 trigger_next = true
 next_command = ["python", "-m", "etl.es_lookup"]
-batch_max_records = 100
-batch_interval_seconds = 600
-poll_timeout_ms = 1000
+max_messages = 100
+poll_timeout_seconds = 10.0
 
 [message]
 id_attribute = "event_id"

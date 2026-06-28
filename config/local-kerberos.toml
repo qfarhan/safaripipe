@@ -1,0 +1,50 @@
+[pipeline]
+environment = "local-kerberos"
+
+[kafka]
+topic = "control-topic"
+value_schema_file = "samples/control_message.avsc"
+
+# Kerberos (SASL/GSSAPI) against the broker's "kafka" service principal.
+#
+# NOTE: confluent-kafka's prebuilt wheels often ship a librdkafka built WITHOUT
+# GSSAPI (you'll see: No provider for SASL mechanism GSSAPI, or
+# 'Property not available: "sasl.kerberos.keytab"'). Run this env from a host /
+# container whose librdkafka was built with SASL/GSSAPI. See
+# docs/real-world-kerberos-avro.md. The broker side is verified with the Kafka
+# console tools in scripts/verify_kerberos_broker.sh.
+[kafka.client]
+"bootstrap.servers" = "localhost:9092"
+"client.id" = "etl-control-local-kerberos"
+"security.protocol" = "SASL_PLAINTEXT"
+"sasl.mechanism" = "GSSAPI"
+"sasl.kerberos.service.name" = "kafka"
+"sasl.kerberos.principal" = "client@EXAMPLE.COM"
+"sasl.kerberos.keytab" = "kerberos/keytabs/client.keytab"
+
+[kafka.consumer]
+"group.id" = "etl-local-kerberos"
+"auto.offset.reset" = "earliest"
+"enable.auto.commit" = true
+
+[schema_registry]
+"url" = "http://localhost:8081"
+
+[consumer]
+output_dir = "data/converted"
+trigger_next = true
+next_command = ["python", "-m", "etl.es_lookup"]
+max_messages = 100
+poll_timeout_seconds = 10.0
+
+[message]
+id_attribute = "event_id"
+
+[elasticsearch]
+hosts = ["http://localhost:9200"]
+index = "source-index"
+request_timeout_seconds = 30
+verify_certs = false
+username = ""
+password = ""
+api_key = ""
