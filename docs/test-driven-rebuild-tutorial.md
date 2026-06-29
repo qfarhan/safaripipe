@@ -482,9 +482,24 @@ def write_json_file(path: Path, payload: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
+
+
+def get_nested(data: dict[str, Any], dotted_path: str) -> Any:
+    """Resolve a dotted key path like 'header.batchId' through nested dicts.
+
+    A path without dots is a plain single-key lookup, so existing flat
+    attributes (e.g. 'event_id') keep working unchanged. Raises KeyError if
+    any segment along the path is missing or not an object.
+    """
+    current: Any = data
+    for segment in dotted_path.split("."):
+        if not isinstance(current, dict) or segment not in current:
+            raise KeyError(dotted_path)
+        current = current[segment]
+    return current
 ```
 
-Three tiny functions, each with one job:
+Four small helpers, each with one job:
 
 - `load_json_file` / `parse_json_object` both **validate that the top-level value is a
   dict**. The whole pipeline assumes "a message is a JSON object"; these guards turn a
@@ -497,6 +512,14 @@ Three tiny functions, each with one job:
     `sort_keys` in particular makes file contents stable regardless of dict insertion
     order, which keeps the output testable.
   - The trailing `handle.write("\n")` gives a POSIX-friendly final newline.
+- `get_nested` — the dotted-path walker that the rest of the pipeline resolves IDs and
+  status fields through. It splits on `.` and steps down one dict at a time, so
+  `get_nested(payload, "header.batchId")` reaches a nested field. The key property is that
+  **a path with no dots is just a single-key lookup**: `get_nested(payload, "event_id")`
+  behaves exactly like `payload["event_id"]`. That is what lets the early flat-config
+  stages and the later nested-config stage (Stage 15) share one code path — nothing about
+  it changes; we just point config at a deeper field. A missing or non-object segment
+  raises a clear `KeyError(dotted_path)`. `message.py` and `es_lookup.py` both import it.
 
 **Checkpoint 4** — round-trip through disk:
 
@@ -536,9 +559,32 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from .json_io import get_nested
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def status_matches(payload: dict[str, Any], status_field: str, status_value: Any) -> bool:
+    """Decide whether a control message clears the save-gate.
+
+    The consumer only converts and saves a message when its status field equals
+    the configured value (e.g. control.batch.processStatus == "End"). status_field
+    is a dotted path (see json_io.get_nested), so it can point at a nested field.
+
+    - An empty/unset status_field disables the gate (everything passes), keeping
+      behaviour backwards compatible when no gate is configured.
+    - A missing field counts as "no match" so partial/intermediate messages are
+      skipped rather than crashing the consumer.
+    """
+    if not status_field:
+        return True
+    try:
+        actual = get_nested(payload, status_field)
+    except KeyError:
+        return False
+    return str(actual) == str(status_value)
 
 
 def convert_control_message(
@@ -548,15 +594,20 @@ def convert_control_message(
     source: str,
     kafka_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if id_attribute not in payload:
-        raise KeyError(f"Control message is missing required ID attribute '{id_attribute}'")
+    # id_attribute may be a dotted path into a nested object, e.g. "header.batchId".
+    try:
+        id_value = get_nested(payload, id_attribute)
+    except KeyError as exc:
+        raise KeyError(
+            f"Control message is missing required ID attribute '{id_attribute}'"
+        ) from exc
 
     return {
         "message_id": str(uuid4()),
         "converted_at": utc_now_iso(),
         "source": source,
         "id_attribute": id_attribute,
-        "id_value": payload[id_attribute],
+        "id_value": id_value,
         "kafka": kafka_metadata or {},
         "payload": payload,
     }
@@ -567,12 +618,21 @@ Walkthrough:
 - `utc_now_iso()` — produces `2026-06-22T02:10:23.014528Z`. It builds a timezone-aware UTC
   timestamp, then swaps the `+00:00` offset for the `Z` suffix that downstream consumers
   and Elasticsearch date parsers expect.
+- `status_matches` — the **save-gate** decision the consumer consults before it converts or
+  saves anything (wired in at Stage 7). It resolves `status_field` through `get_nested`, so
+  the gate can key off a nested field like `control.batch.processStatus`. An empty
+  `status_field` disables the gate (returns `True`), which is why the early stages — whose
+  config leaves it unset — behave exactly as if there were no gate; a missing field returns
+  `False` so intermediate messages are skipped, not crashed on. It is exercised for real in
+  Stage 15 once config supplies `status_field`/`status_value`.
 - `convert_control_message`:
   - The `*` forces `id_attribute`, `source`, `kafka_metadata` to be **keyword-only**.
     Callers must write `convert_control_message(payload, id_attribute=..., source=...)`,
     which keeps call sites self-documenting and prevents positional mix-ups.
-  - The guard raises a clear `KeyError` if the configured id field is missing — fail fast,
-    at the point of conversion, with the field name in the message.
+  - The id is resolved with `get_nested(payload, id_attribute)`, so a dotted `id_attribute`
+    (`header.batchId`) is promoted into the flat `id_value`. With the early flat config
+    (`event_id`) this is an ordinary single-key lookup. A missing field re-raises as a clear
+    `KeyError` naming the attribute — fail fast, at the point of conversion.
   - The returned envelope is the canonical shape every later stage relies on:
     - `message_id` — a fresh UUID per conversion (de-dupes output filenames).
     - `converted_at` — when we processed it.
@@ -634,7 +694,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config
-from .json_io import load_json_file, parse_json_object
+from .json_io import get_nested, load_json_file, parse_json_object
 
 
 def build_query_from_id(id_attribute: str, id_value: str) -> dict[str, Any]:
@@ -648,17 +708,26 @@ def normalize_query(query_json: dict[str, Any]) -> dict[str, Any]:
 
 
 def extract_id_from_message(message: dict[str, Any], id_attribute: str) -> str:
+    # Converted messages carry the resolved value flat in id_value, so a nested
+    # id_attribute does not need re-walking here.
     if "id_value" in message:
         return str(message["id_value"])
 
+    # Raw messages: id_attribute may be a dotted path (e.g. "header.batchId"),
+    # found either inside the payload wrapper or at the top level.
     payload = message.get("payload")
-    if isinstance(payload, dict) and id_attribute in payload:
-        return str(payload[id_attribute])
+    if isinstance(payload, dict):
+        try:
+            return str(get_nested(payload, id_attribute))
+        except KeyError:
+            pass
 
-    if id_attribute in message:
-        return str(message[id_attribute])
-
-    raise KeyError(f"Could not find ID attribute '{id_attribute}' in message")
+    try:
+        return str(get_nested(message, id_attribute))
+    except KeyError as exc:
+        raise KeyError(
+            f"Could not find ID attribute '{id_attribute}' in message"
+        ) from exc
 ```
 
 The three pure helpers — this is the testable core:
@@ -670,10 +739,13 @@ The three pure helpers — this is the testable core:
   `--query-json` CLI flag be forgiving about what the user pastes.
 - `extract_id_from_message` — finds the id across the three shapes the pipeline can hand
   it, in priority order:
-  1. a converted envelope (has `id_value`) — the common case from the consumer;
-  2. a converted envelope's nested `payload`;
-  3. a raw message where the id sits at the top level.
-  If none match, a clear `KeyError`.
+  1. a converted envelope (has `id_value`) — the common case from the consumer. The value
+     was already resolved at conversion time, so a nested `id_attribute` needs no re-walking
+     here;
+  2. a raw message's nested `payload`, resolved with `get_nested(payload, id_attribute)`;
+  3. a raw message where the id sits at the top level, resolved with `get_nested(message, …)`.
+  The same dotted-path walker means a flat `event_id` and a nested `header.batchId` both go
+  through one code path. If none match, a clear `KeyError`.
 
 Next, the lazy client factory:
 
@@ -882,7 +954,7 @@ from typing import Any, Iterable
 
 from .config import load_config, resolve_project_path
 from .json_io import load_json_file, write_json_file
-from .message import convert_control_message
+from .message import convert_control_message, status_matches
 
 
 DEFAULT_BATCH_INTERVAL_SECONDS = 600.0
@@ -1071,6 +1143,23 @@ def process_payload(
     dry_run_next: bool,
 ) -> dict[str, Any]:
     config = load_config(env)
+
+    # Save-gate: only messages whose status field matches the configured value
+    # (e.g. control.batch.processStatus == "End") are converted and saved. A
+    # message that does not clear the gate is acknowledged but skipped — nothing
+    # is written and the next component is not triggered. An unset status_field
+    # disables the gate, so the early flat-config stages save everything.
+    status_field = str(config.message.get("status_field", ""))
+    status_value = config.message.get("status_value", "")
+    if not status_matches(payload, status_field, status_value):
+        return {
+            "saved_file": None,
+            "skipped": True,
+            "skip_reason": f"{status_field} != {status_value!r}",
+            "converted": None,
+            "next_result": None,
+        }
+
     id_attribute = str(config.message.get("id_attribute", "event_id"))
     converted = convert_control_message(
         payload,
@@ -1097,19 +1186,23 @@ def process_payload(
             "stderr": completed.stderr.strip(),
         }
 
-    return {"saved_file": str(destination), "converted": converted, "next_result": next_result}
+    return {"saved_file": str(destination), "skipped": False, "converted": converted, "next_result": next_result}
 ```
 
 This is the per-message workflow, shared by the file-debug path and the live loop:
 
-1. Load config; read the id attribute.
-2. Convert the raw payload into the canonical envelope (Stage 5).
+1. Load config; **check the save-gate first** with `status_matches` (Stage 5). If the message
+   does not clear the gate, return immediately with `skipped: True` and a `skip_reason` —
+   nothing is written and the next stage is not triggered. With the early flat config
+   `status_field` is unset, so the gate is a no-op and every message passes; Stage 15 turns
+   it on by configuring `control.batch.processStatus == "End"`.
+2. Read the id attribute and convert the raw payload into the canonical envelope (Stage 5).
 3. Resolve the output dir to an absolute path and write the JSON (Stage 4).
 4. Decide whether to trigger the next stage. Note the three-state `trigger_next`:
    `None` means "defer to config's `trigger_next`," while `True`/`False` are explicit CLI
    overrides (`--trigger-next` / `--no-trigger-next`).
 5. If triggering, shell out and capture `returncode`/`stdout`/`stderr`.
-6. Return a structured result the CLI prints.
+6. Return a structured result (`skipped: False`) the CLI prints.
 
 ### part 6: the live poll loop
 
@@ -2262,102 +2355,40 @@ Both fields are *nested*, so the message now looks like this (`samples/control_m
 Keep a second sample with `processStatus: "Start"` (`samples/control_message_start.json`) so
 you can prove the skip path.
 
-### 15.1 One helper does the nested walk — `get_nested`
+### 15.1 No new code — the machinery was built for this
 
-A dotted path (`header.batchId`, `control.batch.processStatus`) can't index a dict directly,
-so add a single walker to `src/etl/json_io.py` and reuse it everywhere:
+This is the payoff of building the helpers generic from the start: **every line of code this
+stage needs already exists.** Stage 15 is a *configuration* change, not a refactor. Here is
+what is already in place and why each piece already handles nesting:
 
-```python
-def get_nested(data: dict[str, Any], dotted_path: str) -> Any:
-    """Resolve a dotted key path like 'header.batchId' through nested dicts.
+- **`get_nested`** (Stage 4, `json_io.py`) — the dotted-path walker. `header.batchId` and
+  `control.batch.processStatus` step down one dict at a time; a dotless key like `event_id`
+  stays a plain lookup. Nothing to add.
+- **`status_matches`** (Stage 5, `message.py`) — already resolves `status_field` through
+  `get_nested`, so the gate keys off `control.batch.processStatus` the moment config supplies
+  it. Until now `status_field` was unset, so the gate passed everything.
+- **`convert_control_message`** (Stage 5) — already extracts the id with
+  `get_nested(payload, id_attribute)`, so a nested `header.batchId` is promoted into the flat
+  `id_value` of the converted envelope.
+- **`process_payload`** (Stage 7) — already consults the save-gate before converting/saving
+  and returns a no-op `{"skipped": True, ...}` result when a message does not clear it.
+- **`extract_id_from_message`** (Stage 6, `es_lookup.py`) — already walks the nested
+  `payload`/top-level branches with `get_nested`, while still short-circuiting on a converted
+  envelope's `id_value`.
 
-    A path without dots is a plain single-key lookup, so existing flat
-    attributes (e.g. 'event_id') keep working unchanged. Raises KeyError if
-    any segment along the path is missing or not an object.
-    """
-    current: Any = data
-    for segment in dotted_path.split("."):
-        if not isinstance(current, dict) or segment not in current:
-            raise KeyError(dotted_path)
-        current = current[segment]
-    return current
-```
+So all that changes below is the **config** (point `id_attribute`/`status_field` at the nested
+paths), the **sample** (the nested message shape shown above), and **new tests** that exercise
+the nested paths now that config finally reaches them.
 
-The "no dots → plain lookup" property is what makes this backwards compatible: a config that
-still uses `event_id` behaves exactly as before.
+### 15.2 The lookup query needs no change either — `build_query_from_id`
 
-### 15.2 The save-gate — `status_matches` in `src/etl/message.py`
+With `id_attribute = "header.batchId"` it emits `{"term": {"header.batchId": v}}` — and a
+dotted name is exactly how Elasticsearch addresses an `object` subfield. (Two caveats: if
+`header` is mapped as ES `type: nested` you'd need a `nested` query instead; and if `batchId`
+is mapped as `text` rather than `keyword`, a `term` needs `header.batchId.keyword` because
+text is analyzed. The e2e index below maps it as `keyword`.)
 
-```python
-def status_matches(payload: dict[str, Any], status_field: str, status_value: Any) -> bool:
-    """Decide whether a control message clears the save-gate.
-
-    - An empty/unset status_field disables the gate (everything passes).
-    - A missing field counts as "no match" so partial messages are skipped,
-      not crashed on.
-    """
-    if not status_field:
-        return True
-    try:
-        actual = get_nested(payload, status_field)
-    except KeyError:
-        return False
-    return str(actual) == str(status_value)
-```
-
-`convert_control_message` also switches its id extraction from `payload[id_attribute]` to
-`get_nested(payload, id_attribute)`, so the nested `header.batchId` is promoted into the flat
-`id_value` of the converted envelope.
-
-### 15.3 Wire the gate into the consumer — `process_payload`
-
-The gate runs **before** conversion/saving. A skipped message returns a clear, no-op result:
-
-```python
-config = load_config(env)
-
-status_field = str(config.message.get("status_field", ""))
-status_value = config.message.get("status_value", "")
-if not status_matches(payload, status_field, status_value):
-    return {
-        "saved_file": None,
-        "skipped": True,
-        "skip_reason": f"{status_field} != {status_value!r}",
-        "converted": None,
-        "next_result": None,
-    }
-
-id_attribute = str(config.message.get("id_attribute", "event_id"))
-converted = convert_control_message(payload, id_attribute=id_attribute, ...)
-# ... write + trigger next, then return {..., "skipped": False}
-```
-
-### 15.4 The lookup side already works — `extract_id_from_message`
-
-Switch the two payload/top-level branches to `get_nested(...)`. The converted envelope still
-short-circuits on `id_value`, so the nested walk only runs for raw messages:
-
-```python
-payload = message.get("payload")
-if isinstance(payload, dict):
-    try:
-        return str(get_nested(payload, id_attribute))
-    except KeyError:
-        pass
-try:
-    return str(get_nested(message, id_attribute))
-except KeyError as exc:
-    raise KeyError(f"Could not find ID attribute '{id_attribute}' in message") from exc
-```
-
-**No change is needed to `build_query_from_id`.** With `id_attribute = "header.batchId"` it
-emits `{"term": {"header.batchId": v}}` — and a dotted name is exactly how Elasticsearch
-addresses an `object` subfield. (Two caveats: if `header` is mapped as ES `type: nested` you'd
-need a `nested` query instead; and if `batchId` is mapped as `text` rather than `keyword`, a
-`term` needs `header.batchId.keyword` because text is analyzed. The e2e index below maps it as
-`keyword`.)
-
-### 15.5 Config — `config/local.toml`
+### 15.3 Config — `config/local.toml`
 
 ```toml
 [message]
@@ -2370,30 +2401,106 @@ status_field = "control.batch.processStatus"
 status_value = "End"
 ```
 
-### 15.6 Tests for the gate and the nested path
+### 15.4 Tests for the gate and the nested path
+
+The code did not change this stage, but the behaviour it can now reach did — so this is where
+the nested-path and gate tests are **added** to the test files first written in Stages 5–7.
+The blocks below complete those files; together with the flat-path tests already shown, they
+are the full contents of each test module.
+
+`tests/test_message.py` gains the gate and nested-id cases (alongside the flat
+`test_convert_control_message_promotes_configured_id_attribute` from Stage 5):
 
 ```python
-# tests/test_message.py
+def test_convert_control_message_promotes_nested_id_attribute():
+    converted = convert_control_message(
+        {"header": {"batchId": "batch-9"}, "body": {}},
+        id_attribute="header.batchId",
+        source="test",
+    )
+
+    assert converted["id_value"] == "batch-9"
+
+
 def test_status_matches_on_nested_field():
     payload = {"control": {"batch": {"processStatus": "End"}}}
     assert status_matches(payload, "control.batch.processStatus", "End") is True
     assert status_matches(payload, "control.batch.processStatus", "Start") is False
 
-def test_convert_control_message_promotes_nested_id_attribute():
-    converted = convert_control_message(
-        {"header": {"batchId": "batch-9"}, "body": {}},
-        id_attribute="header.batchId", source="test",
-    )
-    assert converted["id_value"] == "batch-9"
 
-# tests/test_es_lookup.py
-def test_extract_nested_id_from_payload():
-    msg = {"payload": {"header": {"batchId": "batch-9"}}}
-    assert extract_id_from_message(msg, "header.batchId") == "batch-9"
+def test_status_matches_missing_field_is_false():
+    assert status_matches({"control": {}}, "control.batch.processStatus", "End") is False
+
+
+def test_status_matches_disabled_when_field_unset():
+    # An empty status_field disables the gate, so any message passes.
+    assert status_matches({"anything": 1}, "", "End") is True
 ```
 
-And a consumer-level gate test that proves only the `End` message writes a file
-(`tests/test_kafka_consumer.py::test_process_payload_save_gate`).
+(The import line at the top of the file grows to
+`from etl.message import convert_control_message, status_matches`.)
+
+`tests/test_es_lookup.py` gains the nested cases. The `KeyError` case needs `pytest`, so add
+`import pytest` at the top of the file:
+
+```python
+def test_build_query_from_nested_id():
+    # A dotted path is exactly how ES addresses an object subfield in a term query.
+    assert build_query_from_id("header.batchId", "batch-9") == {
+        "query": {"term": {"header.batchId": "batch-9"}}
+    }
+
+
+def test_extract_nested_id_from_payload():
+    message = {"payload": {"header": {"batchId": "batch-9"}, "body": {}}}
+    assert extract_id_from_message(message, "header.batchId") == "batch-9"
+
+
+def test_extract_nested_id_from_top_level():
+    message = {"header": {"batchId": "batch-9"}}
+    assert extract_id_from_message(message, "header.batchId") == "batch-9"
+
+
+def test_extract_missing_nested_id_raises():
+    with pytest.raises(KeyError):
+        extract_id_from_message({"header": {}}, "header.batchId")
+```
+
+And the consumer-level gate test in `tests/test_kafka_consumer.py` proves only the `End`
+message writes a file — it stubs `load_config` so no real config or Kafka is needed:
+
+```python
+def test_process_payload_save_gate(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(
+        message={
+            "id_attribute": "header.batchId",
+            "status_field": "control.batch.processStatus",
+            "status_value": "End",
+        },
+        consumer={"output_dir": str(tmp_path), "trigger_next": False},
+    )
+    monkeypatch.setattr(kafka_consumer, "load_config", lambda env: cfg)
+
+    end_msg = {"header": {"batchId": "b1"}, "control": {"batch": {"processStatus": "End"}}}
+    start_msg = {"header": {"batchId": "b2"}, "control": {"batch": {"processStatus": "Start"}}}
+
+    saved = kafka_consumer.process_payload(
+        payload=end_msg, env="local", source="t", kafka_metadata=None,
+        trigger_next=False, dry_run_next=False,
+    )
+    assert saved["skipped"] is False
+    assert Path(saved["saved_file"]).exists()
+
+    skipped = kafka_consumer.process_payload(
+        payload=start_msg, env="local", source="t", kafka_metadata=None,
+        trigger_next=False, dry_run_next=False,
+    )
+    assert skipped["skipped"] is True
+    assert skipped["saved_file"] is None
+
+    # Only the End message produced a file; the Start message was gated out.
+    assert len(list(tmp_path.glob("*.json"))) == 1
+```
 
 **Checkpoint 15a** — the full unit suite, live:
 
