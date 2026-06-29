@@ -38,7 +38,12 @@ max_messages = 100
 poll_timeout_seconds = 10.0
 
 [message]
-id_attribute = "event_id"
+# id_attribute is a dotted path; header.batchId is promoted to id_value and used
+# as the Elasticsearch term-query field by etl.es_lookup.
+id_attribute = "header.batchId"
+# Save-gate: only persist a message when this dotted-path field equals status_value.
+status_field = "control.batch.processStatus"
+status_value = "End"
 
 [elasticsearch]
 hosts = ["http://localhost:9200"]

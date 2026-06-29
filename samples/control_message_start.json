@@ -1,11 +1,11 @@
 {
   "header": {
-    "batchId": "batch-2026-06-29-001",
+    "batchId": "batch-2026-06-29-002",
     "eventType": "customer.updated"
   },
   "control": {
     "batch": {
-      "processStatus": "End",
+      "processStatus": "Start",
       "publishedAt": "2026-06-21T00:00:00Z"
     }
   },

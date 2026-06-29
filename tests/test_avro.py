@@ -23,6 +23,20 @@ def test_sample_message_roundtrips_against_avro_schema():
     buffer.seek(0)
     decoded = fastavro.schemaless_reader(buffer, parsed)
 
-    assert decoded["event_id"] == record["event_id"]
-    assert decoded["event_type"] == record["event_type"]
+    assert decoded["header"]["batchId"] == record["header"]["batchId"]
+    assert decoded["control"]["batch"]["processStatus"] == record["control"]["batch"]["processStatus"]
     assert decoded["attributes"]["tenant"] == "demo"
+
+
+def test_start_sample_roundtrips_against_avro_schema():
+    """The Start (skipped) sample must also validate against the same schema."""
+    schema = json.loads((PROJECT_ROOT / "samples" / "control_message.avsc").read_text())
+    parsed = fastavro.parse_schema(schema)
+    record = load_json_file(PROJECT_ROOT / "samples" / "control_message_start.json")
+
+    buffer = io.BytesIO()
+    fastavro.schemaless_writer(buffer, parsed, record)
+    buffer.seek(0)
+    decoded = fastavro.schemaless_reader(buffer, parsed)
+
+    assert decoded["control"]["batch"]["processStatus"] == "Start"

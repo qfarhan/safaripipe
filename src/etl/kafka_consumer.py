@@ -10,7 +10,7 @@ from typing import Any, Iterable
 from .avro_io import create_avro_deserializer, create_schema_registry_client
 from .config import consumer_client_config, load_config, resolve_project_path
 from .json_io import load_json_file, write_json_file
-from .message import convert_control_message
+from .message import convert_control_message, status_matches
 
 
 DEFAULT_POLL_TIMEOUT_SECONDS = 10.0
@@ -107,6 +107,22 @@ def process_payload(
     dry_run_next: bool,
 ) -> dict[str, Any]:
     config = load_config(env)
+
+    # Save-gate: only messages whose status field matches the configured value
+    # (e.g. control.batch.processStatus == "End") are converted and saved. A
+    # message that does not clear the gate is acknowledged but skipped — nothing
+    # is written and the next component is not triggered.
+    status_field = str(config.message.get("status_field", ""))
+    status_value = config.message.get("status_value", "")
+    if not status_matches(payload, status_field, status_value):
+        return {
+            "saved_file": None,
+            "skipped": True,
+            "skip_reason": f"{status_field} != {status_value!r}",
+            "converted": None,
+            "next_result": None,
+        }
+
     id_attribute = str(config.message.get("id_attribute", "event_id"))
     converted = convert_control_message(
         payload,
@@ -137,7 +153,12 @@ def process_payload(
             "stderr": completed.stderr.strip(),
         }
 
-    return {"saved_file": str(destination), "converted": converted, "next_result": next_result}
+    return {
+        "saved_file": str(destination),
+        "skipped": False,
+        "converted": converted,
+        "next_result": next_result,
+    }
 
 
 def consume_messages(

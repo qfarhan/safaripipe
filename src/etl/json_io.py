@@ -25,3 +25,18 @@ def write_json_file(path: Path, payload: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
+
+
+def get_nested(data: dict[str, Any], dotted_path: str) -> Any:
+    """Resolve a dotted key path like 'header.batchId' through nested dicts.
+
+    A path without dots is a plain single-key lookup, so existing flat
+    attributes (e.g. 'event_id') keep working unchanged. Raises KeyError if
+    any segment along the path is missing or not an object.
+    """
+    current: Any = data
+    for segment in dotted_path.split("."):
+        if not isinstance(current, dict) or segment not in current:
+            raise KeyError(dotted_path)
+        current = current[segment]
+    return current

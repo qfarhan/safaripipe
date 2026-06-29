@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config
-from .json_io import load_json_file, parse_json_object
+from .json_io import get_nested, load_json_file, parse_json_object
 
 
 def build_query_from_id(id_attribute: str, id_value: str) -> dict[str, Any]:
@@ -20,17 +20,26 @@ def normalize_query(query_json: dict[str, Any]) -> dict[str, Any]:
 
 
 def extract_id_from_message(message: dict[str, Any], id_attribute: str) -> str:
+    # Converted messages carry the resolved value flat in id_value, so a nested
+    # id_attribute does not need re-walking here.
     if "id_value" in message:
         return str(message["id_value"])
 
+    # Raw messages: id_attribute may be a dotted path (e.g. "header.batchId"),
+    # found either inside the payload wrapper or at the top level.
     payload = message.get("payload")
-    if isinstance(payload, dict) and id_attribute in payload:
-        return str(payload[id_attribute])
+    if isinstance(payload, dict):
+        try:
+            return str(get_nested(payload, id_attribute))
+        except KeyError:
+            pass
 
-    if id_attribute in message:
-        return str(message[id_attribute])
-
-    raise KeyError(f"Could not find ID attribute '{id_attribute}' in message")
+    try:
+        return str(get_nested(message, id_attribute))
+    except KeyError as exc:
+        raise KeyError(
+            f"Could not find ID attribute '{id_attribute}' in message"
+        ) from exc
 
 
 def create_es_client(es_config: dict[str, Any]):

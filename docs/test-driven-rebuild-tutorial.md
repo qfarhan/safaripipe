@@ -2238,3 +2238,230 @@ docker compose up -d --remove-orphans      # base stack only; drops the KDC
 
 The same discipline as the rest of the tutorial: each Kerberos layer has a checkpoint that
 proves it before you rely on the next one.
+
+## Stage 15 — Save-gate on `processStatus` + nested `header.batchId` lookup
+
+Real control messages are rarely flat. Two business rules drive this stage:
+
+1. **Only persist completed batches.** A message is saved (and the ES lookup triggered)
+   **only** when `control.batch.processStatus == "End"`. `Start`/intermediate messages are
+   acknowledged but skipped.
+2. **The id lives in a nested field.** The Elasticsearch key is `header.batchId`, not a
+   top-level attribute.
+
+Both fields are *nested*, so the message now looks like this (`samples/control_message.json`):
+
+```json
+{
+  "header": { "batchId": "batch-2026-06-29-001", "eventType": "customer.updated" },
+  "control": { "batch": { "processStatus": "End", "publishedAt": "2026-06-21T00:00:00Z" } },
+  "attributes": { "tenant": "demo", "priority": "normal" }
+}
+```
+
+Keep a second sample with `processStatus: "Start"` (`samples/control_message_start.json`) so
+you can prove the skip path.
+
+### 15.1 One helper does the nested walk — `get_nested`
+
+A dotted path (`header.batchId`, `control.batch.processStatus`) can't index a dict directly,
+so add a single walker to `src/etl/json_io.py` and reuse it everywhere:
+
+```python
+def get_nested(data: dict[str, Any], dotted_path: str) -> Any:
+    """Resolve a dotted key path like 'header.batchId' through nested dicts.
+
+    A path without dots is a plain single-key lookup, so existing flat
+    attributes (e.g. 'event_id') keep working unchanged. Raises KeyError if
+    any segment along the path is missing or not an object.
+    """
+    current: Any = data
+    for segment in dotted_path.split("."):
+        if not isinstance(current, dict) or segment not in current:
+            raise KeyError(dotted_path)
+        current = current[segment]
+    return current
+```
+
+The "no dots → plain lookup" property is what makes this backwards compatible: a config that
+still uses `event_id` behaves exactly as before.
+
+### 15.2 The save-gate — `status_matches` in `src/etl/message.py`
+
+```python
+def status_matches(payload: dict[str, Any], status_field: str, status_value: Any) -> bool:
+    """Decide whether a control message clears the save-gate.
+
+    - An empty/unset status_field disables the gate (everything passes).
+    - A missing field counts as "no match" so partial messages are skipped,
+      not crashed on.
+    """
+    if not status_field:
+        return True
+    try:
+        actual = get_nested(payload, status_field)
+    except KeyError:
+        return False
+    return str(actual) == str(status_value)
+```
+
+`convert_control_message` also switches its id extraction from `payload[id_attribute]` to
+`get_nested(payload, id_attribute)`, so the nested `header.batchId` is promoted into the flat
+`id_value` of the converted envelope.
+
+### 15.3 Wire the gate into the consumer — `process_payload`
+
+The gate runs **before** conversion/saving. A skipped message returns a clear, no-op result:
+
+```python
+config = load_config(env)
+
+status_field = str(config.message.get("status_field", ""))
+status_value = config.message.get("status_value", "")
+if not status_matches(payload, status_field, status_value):
+    return {
+        "saved_file": None,
+        "skipped": True,
+        "skip_reason": f"{status_field} != {status_value!r}",
+        "converted": None,
+        "next_result": None,
+    }
+
+id_attribute = str(config.message.get("id_attribute", "event_id"))
+converted = convert_control_message(payload, id_attribute=id_attribute, ...)
+# ... write + trigger next, then return {..., "skipped": False}
+```
+
+### 15.4 The lookup side already works — `extract_id_from_message`
+
+Switch the two payload/top-level branches to `get_nested(...)`. The converted envelope still
+short-circuits on `id_value`, so the nested walk only runs for raw messages:
+
+```python
+payload = message.get("payload")
+if isinstance(payload, dict):
+    try:
+        return str(get_nested(payload, id_attribute))
+    except KeyError:
+        pass
+try:
+    return str(get_nested(message, id_attribute))
+except KeyError as exc:
+    raise KeyError(f"Could not find ID attribute '{id_attribute}' in message") from exc
+```
+
+**No change is needed to `build_query_from_id`.** With `id_attribute = "header.batchId"` it
+emits `{"term": {"header.batchId": v}}` — and a dotted name is exactly how Elasticsearch
+addresses an `object` subfield. (Two caveats: if `header` is mapped as ES `type: nested` you'd
+need a `nested` query instead; and if `batchId` is mapped as `text` rather than `keyword`, a
+`term` needs `header.batchId.keyword` because text is analyzed. The e2e index below maps it as
+`keyword`.)
+
+### 15.5 Config — `config/local.toml`
+
+```toml
+[message]
+# id_attribute is a dotted path; header.batchId is promoted to id_value and used
+# as the Elasticsearch term-query field by etl.es_lookup.
+id_attribute = "header.batchId"
+# Save-gate: only persist a message when this dotted-path field equals status_value.
+# Leave status_field empty ("") to disable the gate.
+status_field = "control.batch.processStatus"
+status_value = "End"
+```
+
+### 15.6 Tests for the gate and the nested path
+
+```python
+# tests/test_message.py
+def test_status_matches_on_nested_field():
+    payload = {"control": {"batch": {"processStatus": "End"}}}
+    assert status_matches(payload, "control.batch.processStatus", "End") is True
+    assert status_matches(payload, "control.batch.processStatus", "Start") is False
+
+def test_convert_control_message_promotes_nested_id_attribute():
+    converted = convert_control_message(
+        {"header": {"batchId": "batch-9"}, "body": {}},
+        id_attribute="header.batchId", source="test",
+    )
+    assert converted["id_value"] == "batch-9"
+
+# tests/test_es_lookup.py
+def test_extract_nested_id_from_payload():
+    msg = {"payload": {"header": {"batchId": "batch-9"}}}
+    assert extract_id_from_message(msg, "header.batchId") == "batch-9"
+```
+
+And a consumer-level gate test that proves only the `End` message writes a file
+(`tests/test_kafka_consumer.py::test_process_payload_save_gate`).
+
+**Checkpoint 15a** — the full unit suite, live:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+Expected:
+
+```
+.........................                                                [100%]
+25 passed in 0.12s
+```
+
+**Checkpoint 15b** — prove the gate in debug mode (no Kafka needed). The `End` sample saves
+and triggers the lookup; the `Start` sample is skipped:
+
+```bash
+# End → saves + triggers es_lookup (dry-run)
+.venv/bin/python -m etl.kafka_consumer --env local \
+  --message-file samples/control_message.json --trigger-next --dry-run-next
+
+# Start → skipped, nothing written
+.venv/bin/python -m etl.kafka_consumer --env local \
+  --message-file samples/control_message_start.json --trigger-next --dry-run-next
+```
+
+Expected (trimmed) — note the term query targets `header.batchId`, and the Start run is gated:
+
+```json
+// End message
+{ "saved_file": ".../batch-2026-06-29-001-<uuid>.json", "skipped": false,
+  "next_result": { "returncode": 0,
+    "stdout": "... \"term\": { \"header.batchId\": \"batch-2026-06-29-001\" } ..." } }
+
+// Start message
+{ "saved_file": null, "skipped": true,
+  "skip_reason": "control.batch.processStatus != 'End'" }
+```
+
+**Checkpoint 15c** — the live Docker e2e. The index maps `header.batchId` as `keyword`, the
+script publishes a `Start` (skipped) and an `End` (saved) Avro message, and the End lookup
+returns a hit:
+
+```bash
+docker compose up -d
+PYTHON=.venv/bin/python ./scripts/bootstrap_e2e_docker.sh
+```
+
+Expected — one skipped, one saved, and the live ES term query on `header.batchId` matches:
+
+```
+[SKIPPED] saved_file=None
+[SAVED]   saved_file=batch-2026-06-29-001-<uuid>.json
+   query   : {"term": {"header.batchId": "batch-2026-06-29-001"}}
+   ES hits : 1   (hit _id = batch-2026-06-29-001)
+```
+
+> **Stale-index gotcha (verified):** if `source-index` already exists from an earlier run, a
+> `PUT` with a new mapping is silently rejected and ES *dynamically* maps `header.batchId` as
+> `text` — then the `term` query tokenizes the hyphenated id and returns **0 hits**. The e2e
+> script now `DELETE`s the index before recreating it so the `keyword` mapping always applies.
+
+### Stage 15 testing strategy
+
+| Layer | What | How verified |
+|---|---|---|
+| `get_nested` / `status_matches` | nested walk + gate decision | Checkpoint 15a (unit) |
+| `process_payload` gate | only `End` is written | Checkpoint 15a + 15b |
+| nested id extraction | `header.batchId` → query field | Checkpoint 15b |
+| live Avro + gate + ES | end-to-end over the wire | Checkpoint 15c (1 hit) |

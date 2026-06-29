@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -79,6 +80,38 @@ def test_output_path_uses_id_value_and_message_id(tmp_path):
     )
     # the slash in the id must be sanitized so it does not create a subdirectory
     assert path.name == "a_b-mid.json"
+
+
+def test_process_payload_save_gate(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(
+        message={
+            "id_attribute": "header.batchId",
+            "status_field": "control.batch.processStatus",
+            "status_value": "End",
+        },
+        consumer={"output_dir": str(tmp_path), "trigger_next": False},
+    )
+    monkeypatch.setattr(kafka_consumer, "load_config", lambda env: cfg)
+
+    end_msg = {"header": {"batchId": "b1"}, "control": {"batch": {"processStatus": "End"}}}
+    start_msg = {"header": {"batchId": "b2"}, "control": {"batch": {"processStatus": "Start"}}}
+
+    saved = kafka_consumer.process_payload(
+        payload=end_msg, env="local", source="t", kafka_metadata=None,
+        trigger_next=False, dry_run_next=False,
+    )
+    assert saved["skipped"] is False
+    assert Path(saved["saved_file"]).exists()
+
+    skipped = kafka_consumer.process_payload(
+        payload=start_msg, env="local", source="t", kafka_metadata=None,
+        trigger_next=False, dry_run_next=False,
+    )
+    assert skipped["skipped"] is True
+    assert skipped["saved_file"] is None
+
+    # Only the End message produced a file; the Start message was gated out.
+    assert len(list(tmp_path.glob("*.json"))) == 1
 
 
 def test_consume_messages_deserializes_and_stops_on_drain(monkeypatch):

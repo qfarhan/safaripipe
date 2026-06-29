@@ -4,10 +4,39 @@
   "namespace": "etl.control",
   "doc": "Canonical control message published to the Kafka control topic.",
   "fields": [
-    {"name": "event_id", "type": "string", "doc": "Primary key promoted to id_value."},
-    {"name": "event_type", "type": "string"},
-    {"name": "source_index", "type": ["null", "string"], "default": null},
-    {"name": "published_at", "type": ["null", "string"], "default": null},
+    {
+      "name": "header",
+      "doc": "Routing/identity envelope. batchId is promoted to id_value for the ES lookup.",
+      "type": {
+        "type": "record",
+        "name": "Header",
+        "fields": [
+          {"name": "batchId", "type": "string", "doc": "Primary key; queried as header.batchId in Elasticsearch."},
+          {"name": "eventType", "type": ["null", "string"], "default": null}
+        ]
+      }
+    },
+    {
+      "name": "control",
+      "doc": "Processing-control envelope. The consumer only saves when batch.processStatus == \"End\".",
+      "type": {
+        "type": "record",
+        "name": "Control",
+        "fields": [
+          {
+            "name": "batch",
+            "type": {
+              "type": "record",
+              "name": "Batch",
+              "fields": [
+                {"name": "processStatus", "type": "string", "doc": "Start | End. Only \"End\" is persisted."},
+                {"name": "publishedAt", "type": ["null", "string"], "default": null}
+              ]
+            }
+          }
+        ]
+      }
+    },
     {
       "name": "attributes",
       "type": {"type": "map", "values": "string"},
