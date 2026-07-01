@@ -2,6 +2,9 @@
 environment = "local"
 
 [kafka]
+# Single topic. To drain several sources in one EOD run, replace `topic` with a
+# list, e.g. topics = ["control-topic", "c360-control", "orders-control"]; a list
+# takes precedence and one consumer group reads all of them.
 topic = "control-topic"
 value_schema_file = "samples/control_message.avsc"
 
@@ -39,8 +42,18 @@ status_value = "End"
 [elasticsearch]
 hosts = ["http://localhost:9200"]
 index = "source-index"
+# Field the id value is matched against in a term query. Defaults to id_attribute
+# (header.batchId) when unset, which is correct when batchId is mapped as keyword.
+# If batchId is mapped as `text` with a keyword subfield, set the subfield here:
+# term_field = "header.batchId.keyword"
 request_timeout_seconds = 30
 verify_certs = false
 username = ""
 password = ""
 api_key = ""
+# A batch can match thousands of records, so es_lookup scrolls through every
+# hit and writes them as JSON-lines to output_dir/<index>-<id_value>.jsonl
+# instead of printing them. Tune scroll_size/scroll_timeout for large batches.
+output_dir = "data/es_results"
+scroll_size = 1000
+scroll_timeout = "2m"

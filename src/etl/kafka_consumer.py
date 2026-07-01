@@ -74,6 +74,20 @@ def trigger_next_component(
     return subprocess.run(full_command, check=True, text=True, capture_output=True)
 
 
+def resolve_topics(kafka_config: dict[str, Any]) -> list[str]:
+    """Topics to subscribe to: prefer a 'topics' list, else the single 'topic'.
+
+    One consumer (and one consumer group) can read many topics at once, so the
+    EOD batch can drain several sources in a single run. Each message still
+    carries its own topic in message_metadata, so downstream routing (e.g. per
+    topic Elasticsearch index) can tell them apart.
+    """
+    topics = kafka_config.get("topics")
+    if topics:
+        return [str(topic) for topic in topics]
+    return [str(kafka_config["topic"])]
+
+
 def resolve_consume_options(
     consumer_config: dict[str, Any],
     *,
@@ -182,8 +196,8 @@ def consume_messages(
 
     consumer = create_kafka_consumer(consumer_client_config(config))
     deserializer = create_avro_deserializer(create_schema_registry_client(config.schema_registry))
-    topic = str(config.kafka["topic"])
-    consumer.subscribe([topic])
+    topics = resolve_topics(config.kafka)
+    consumer.subscribe(topics)
 
     consumed = 0
     try:
