@@ -45,7 +45,7 @@ index = "source-index"
 # Field the id value is matched against in a term query. Defaults to id_attribute
 # (header.batchId) when unset, which is correct when batchId is mapped as keyword.
 # If batchId is mapped as `text` with a keyword subfield, set the subfield here:
-# term_field = "header.batchId.keyword"
+term_field = "header.batchId.keyword"
 request_timeout_seconds = 30
 verify_certs = false
 username = ""
