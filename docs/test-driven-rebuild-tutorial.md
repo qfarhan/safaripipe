@@ -215,6 +215,9 @@ environment = "local"
 
 [kafka]
 bootstrap_servers = ["localhost:9092"]
+# Single topic. To drain several sources in one run, replace `topic` with a list:
+# topics = ["control-topic", "c360-control", "orders-control"]; a list takes
+# precedence and one consumer group reads all of them (see Stage 16).
 topic = "control-topic"
 group_id = "etl-local"
 client_id = "etl-control-consumer-local"
@@ -237,6 +240,9 @@ id_attribute = "event_id"
 [elasticsearch]
 hosts = ["http://localhost:9200"]
 index = "source-index"
+# term_field overrides the ES field the id is matched against (defaults to
+# id_attribute). Set it to the keyword subfield when batchId is mapped as text:
+# term_field = "header.batchId.keyword"  (see Stage 16)
 request_timeout_seconds = 30
 verify_certs = false
 username = ""
@@ -792,6 +798,11 @@ def run_lookup(
 ) -> dict[str, Any]:
     config = load_config(env)
     id_attribute = str(config.message.get("id_attribute", "event_id"))
+    # The field the value is matched against in Elasticsearch can differ from the
+    # JSON path it was read from: when batchId is mapped as `text` with a keyword
+    # subfield, a term query must target `header.batchId.keyword`. term_field
+    # overrides the query field; it defaults to id_attribute when unset.
+    term_field = str(config.elasticsearch.get("term_field", "") or id_attribute)
     index = str(config.elasticsearch.get("index", "source-index"))
 
     if query_json:
@@ -805,7 +816,7 @@ def run_lookup(
             id_value = extract_id_from_message(parse_json_object(raw_json), id_attribute)
         else:
             raise ValueError("Provide one of --message-file, --json, --query-json, or --id")
-        query = build_query_from_id(id_attribute, id_value)
+        query = build_query_from_id(term_field, id_value)
 
     if dry_run:
         return {"dry_run": True, "index": index, "query": query}
@@ -851,6 +862,11 @@ if __name__ == "__main__":
 - `run_lookup` is the seam between CLI and logic. It resolves config, then chooses **one**
   of four input modes (precedence: explicit `--query-json` wins; otherwise
   `--id` > `--message-file` > `--json`; otherwise a clear error).
+- `term_field` separates **where the value is read from** (`id_attribute`, a JSON path) from
+  **which Elasticsearch field it is matched against**. They are usually the same, so it
+  defaults to `id_attribute`; you only set it when the index maps the id as `text` and you
+  must target the `.keyword` subfield. Stage 16 walks through a real message where this
+  matters.
 - `if dry_run:` returns the resolved index + query **before** any client is created — this
   is what makes the component testable and demoable without ES.
 - The live branch runs `client.search(...)` and unwraps `response.body` (the 8.x client
@@ -982,6 +998,20 @@ def decode_kafka_value(value: bytes | str | dict[str, Any]) -> dict[str, Any]:
 ### part 2: the client factory and metadata helpers
 
 ```python
+def resolve_topics(kafka_config: dict[str, Any]) -> list[str]:
+    """Topics to subscribe to: prefer a 'topics' list, else the single 'topic'.
+
+    One consumer (and one consumer group) can read many topics at once, so the
+    EOD batch can drain several sources in a single run. Each message still
+    carries its own topic in message_metadata, so downstream routing (e.g. per
+    topic Elasticsearch index) can tell them apart.
+    """
+    topics = kafka_config.get("topics")
+    if topics:
+        return [str(topic) for topic in topics]
+    return [str(kafka_config["topic"])]
+
+
 def create_kafka_consumer(kafka_config: dict[str, Any]):
     try:
         from kafka import KafkaConsumer
@@ -991,9 +1021,9 @@ def create_kafka_consumer(kafka_config: dict[str, Any]):
             "Install dependencies with 'pip install -e .' or use --message-file for debug runs."
         ) from exc
 
-    topic = kafka_config["topic"]
+    topics = resolve_topics(kafka_config)
     return KafkaConsumer(
-        topic,
+        *topics,
         bootstrap_servers=kafka_config.get("bootstrap_servers", ["localhost:9092"]),
         group_id=kafka_config.get("group_id"),
         client_id=kafka_config.get("client_id", "etl-control-consumer"),
@@ -1023,6 +1053,10 @@ def _decode_key(key: Any) -> str | None:
     return str(key)
 ```
 
+- `resolve_topics` returns the list of topics to read. A single `topic` string still works;
+  setting a `topics` list instead lets one consumer group drain several sources in a single
+  run (`KafkaConsumer(*topics, ...)` subscribes to all of them). Stage 16 uses this for a
+  real multi-source EOD batch.
 - Same lazy-import pattern as ES. The deserializer is wired here, so every record's
   `.value` arrives already decoded into a dict.
 - `message_metadata` uses `getattr(..., None)` so it works on a real Kafka record **or**
@@ -2572,3 +2606,186 @@ Expected — one skipped, one saved, and the live ES term query on `header.batch
 | `process_payload` gate | only `End` is written | Checkpoint 15a + 15b |
 | nested id extraction | `header.batchId` → query field | Checkpoint 15b |
 | live Avro + gate + ES | end-to-end over the wire | Checkpoint 15c (1 hit) |
+
+---
+
+## Stage 16 — Real-world shape: multiple topics + a keyword id field
+
+Production control messages arrive from several source systems, on **several topics**, and
+the id we key on is a **nested field mapped as `text` with a `keyword` subfield**. This stage
+ties together two capabilities the code was already built for — multi-topic subscribe
+(`resolve_topics`, Stage 7) and the configurable `term_field` (Stage 6) — and shows them
+against a real message. No new pipeline code is introduced; this is config + tests + the
+mental model.
+
+### 16.1 The real message and how it is parsed
+
+A real `C360` end-of-day control message looks like this (trimmed):
+
+```json
+{
+  "header": {
+    "messageId": "C360_20260601185100608_00157615",
+    "batchId": "C360_20260601183000_lvapp104533_1457471_106",
+    "sourceSystem": "C360",
+    "messageType": "Control",
+    "processing": "EOD"
+  },
+  "control": {
+    "action": "Start",
+    "subject": "EOD",
+    "eodDate": 1780286400000,
+    "controlHeader": {
+      "businessDate": 1780286400000,
+      "sourceRecordCount": 39402,
+      "targetRecordCount": 0
+    },
+    "batch": {
+      "processStatus": "Start",
+      "batchName": "C360_20260601183000_lvapp104533_1457471_106",
+      "batchDate": 1780286400000
+    }
+  }
+}
+```
+
+The pipeline never hand-parses this. Two dotted paths, resolved by `get_nested` (Stage 4), do
+all the work:
+
+- **`id_attribute = "header.batchId"`** → `convert_control_message` promotes
+  `C360_20260601183000_lvapp104533_1457471_106` into the envelope's flat `id_value`.
+- **`status_field = "control.batch.processStatus"`** → the save-gate reads `"Start"`.
+
+Because `processStatus` is `"Start"`, this exact message is **gated out** — the `Start` only
+announces the batch (`sourceRecordCount: 39402`, `targetRecordCount: 0`). The matching `End`
+message (same `batchId`, `processStatus: "End"`) is the one that clears the gate, gets saved,
+and triggers the Elasticsearch lookup.
+
+### 16.2 The id field is `keyword`, so the query uses `term_field`
+
+The id is matched in Elasticsearch as:
+
+```
+GET <index>/_search?q=header.batchId.keyword:C360_20260601183000_lvapp104533_1457471_106
+```
+
+Note the **`.keyword`** suffix: `header.batchId` is mapped as analyzed `text`, so a `term`
+on the bare `header.batchId` would not match the raw value — it must target the
+`header.batchId.keyword` subfield. That is exactly what `term_field` (Stage 6) is for: it
+keeps the **read path** (`id_attribute = "header.batchId"`, where the value lives in the JSON)
+separate from the **query field** (`term_field = "header.batchId.keyword"`, the ES field).
+
+Our `build_query_from_id` emits a body `term` query rather than the URI `q=` form on purpose:
+the `q=` query-string parser treats characters like `-`, `:`, `/`, and spaces as operators, so
+a raw id can mis-parse; a `term` on the keyword field does zero parsing and matches the exact
+bytes.
+
+### 16.3 Multiple topics + per-topic index routing
+
+Set a `topics` list instead of a single `topic` and one consumer group drains every source in
+a single EOD run; `resolve_topics` + `KafkaConsumer(*topics, ...)` (Stage 7) do this with no
+loop changes. Each message still carries its own `topic` in `message_metadata`, which is the
+hook for routing each source to its own index.
+
+> **Routing is the next step, not yet built.** `es_lookup` currently reads a single
+> `[elasticsearch] index`. To send each topic to its own index, map the envelope's
+> `kafka.topic` to an index name and pass it through; today you would run one config (and
+> `index`) per source, or query a comma-separated/wildcard index.
+
+A config pointed at the real multi-source setup:
+
+```toml
+[kafka]
+topics = ["c360-control", "orders-control"]
+
+[message]
+id_attribute = "header.batchId"
+status_field = "control.batch.processStatus"
+status_value = "End"
+
+[elasticsearch]
+index = "c360-eod"
+term_field = "header.batchId.keyword"
+```
+
+### 16.4 Tests
+
+`tests/test_kafka_consumer.py` — topic resolution (needs no Kafka):
+
+```python
+def test_resolve_topics_prefers_list_over_single():
+    assert kafka_consumer.resolve_topics({"topics": ["a", "b"], "topic": "ignored"}) == ["a", "b"]
+
+
+def test_resolve_topics_falls_back_to_single_topic():
+    assert kafka_consumer.resolve_topics({"topic": "control-topic"}) == ["control-topic"]
+```
+
+`tests/test_es_lookup.py` — the `term_field` flows into the query (a dry-run `run_lookup` with
+a stubbed config, so no ES is needed). Add `from types import SimpleNamespace` and
+`from etl import es_lookup` at the top of the file:
+
+```python
+def _config(*, term_field=None):
+    es = {"index": "source-index"}
+    if term_field is not None:
+        es["term_field"] = term_field
+    return SimpleNamespace(
+        message={"id_attribute": "header.batchId"},
+        elasticsearch=es,
+    )
+
+
+def test_run_lookup_uses_term_field_for_query(monkeypatch):
+    # When the index maps batchId as text+keyword, the term query targets the subfield.
+    monkeypatch.setattr(es_lookup, "load_config", lambda env: _config(term_field="header.batchId.keyword"))
+    result = es_lookup.run_lookup(env="local", direct_id="batch-9", dry_run=True)
+    assert result["query"] == {"query": {"term": {"header.batchId.keyword": "batch-9"}}}
+
+
+def test_run_lookup_term_field_defaults_to_id_attribute(monkeypatch):
+    monkeypatch.setattr(es_lookup, "load_config", lambda env: _config())
+    result = es_lookup.run_lookup(env="local", direct_id="batch-9", dry_run=True)
+    assert result["query"] == {"query": {"term": {"header.batchId": "batch-9"}}}
+```
+
+**Checkpoint 16a** — the full unit suite now covers topics + term_field:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+```text
+.............................                                            [100%]
+29 passed in 0.26s
+```
+
+**Checkpoint 16b** — see the keyword query without a cluster. With
+`term_field = "header.batchId.keyword"` set in `config/local.toml`:
+
+```bash
+.venv/bin/python -m etl.es_lookup --env local \
+  --id "C360_20260601183000_lvapp104533_1457471_106" --dry-run
+```
+
+Expected — the `term` targets the `.keyword` subfield:
+
+```json
+{
+  "dry_run": true,
+  "index": "source-index",
+  "query": { "query": { "term": {
+    "header.batchId.keyword": "C360_20260601183000_lvapp104533_1457471_106"
+  } } }
+}
+```
+
+(With `term_field` unset it falls back to `header.batchId`, the Stage 15 behaviour.)
+
+### Stage 16 testing strategy
+
+| Layer | What | How verified |
+|---|---|---|
+| `resolve_topics` | list wins, else single topic | Checkpoint 16a (unit) |
+| `term_field` | query targets `.keyword`, defaults to `id_attribute` | Checkpoint 16a + 16b |
+| nested JSON parsing | `header.batchId` / `control.batch.processStatus` via `get_nested` | Checkpoints 15a/15b |

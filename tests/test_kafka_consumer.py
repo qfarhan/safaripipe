@@ -114,6 +114,14 @@ def test_process_payload_save_gate(tmp_path, monkeypatch):
     assert len(list(tmp_path.glob("*.json"))) == 1
 
 
+def test_resolve_topics_prefers_list_over_single():
+    assert kafka_consumer.resolve_topics({"topics": ["a", "b"], "topic": "ignored"}) == ["a", "b"]
+
+
+def test_resolve_topics_falls_back_to_single_topic():
+    assert kafka_consumer.resolve_topics({"topic": "control-topic"}) == ["control-topic"]
+
+
 def test_consume_messages_deserializes_and_stops_on_drain(monkeypatch):
     polled = [FakeMessage({"event_id": "one"}), FakeMessage({"event_id": "two"}), None]
 
