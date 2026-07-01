@@ -24,6 +24,10 @@ cat > /etc/krb5kdc/kdc.conf <<EOF
 [realms]
     ${REALM} = {
         acl_file = /etc/krb5kdc/kadm5.acl
+        # Keep the master-key stash on the persistent volume next to the DB.
+        # Debian's default is under /etc/krb5kdc, which does NOT survive a
+        # container recreate, leaving a DB whose master key can't be fetched.
+        key_stash_file = /var/lib/krb5kdc/.k5.${REALM}
         max_renewable_life = 7d 0h 0m 0s
         supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal
         default_principal_flags = +preauth

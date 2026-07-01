@@ -6,3 +6,5 @@ data/converted/
 data/es_results/
 .env
 .DS_Store
+# Keytabs exported from the local KDC (see docker-compose.kerberos.yml).
+kerberos/keytabs/

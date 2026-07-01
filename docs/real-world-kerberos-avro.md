@@ -6,7 +6,14 @@ This note explains the production consumer pattern captured in
 `etl` package in this repo, and what you need to change to authenticate and to
 decode Avro.
 
-There are **two big differences** from the `etl.kafka_consumer` you have today:
+> **Status:** the `etl` package has since adopted this pattern — it now uses
+> `confluent-kafka`, decodes Avro via Schema Registry (`etl.avro_io`), and does
+> keytab-based GSSAPI auth. The combination is verified end-to-end against the
+> local Dockerized KDC by `scripts/verify_kerberos_avro_consumer.sh`. Where this
+> note says "today"/"the etl package", it describes the pre-migration state; the
+> "Mapping onto this repo" sections reflect the current code.
+
+There were **two big differences** from the original `etl.kafka_consumer`:
 
 1. **Authentication** — the broker is reached over `SASL_SSL` with the `GSSAPI`
    (Kerberos) mechanism, using a **keytab + principal**, a **krb5.conf**, and a
@@ -43,6 +50,13 @@ official Schema Registry / Avro integration.
 > (kafka-python avoids this by using the pure-Python `gssapi` package, but it has
 > no Avro/Schema-Registry story — which is why the platform standard is
 > confluent-kafka.)
+>
+> Observed in this repo: the macOS wheel for `confluent-kafka` 2.14.2 **does**
+> ship GSSAPI support (it accepts `sasl.kerberos.keytab` and drives the system
+> `kinit` for ticket refresh), so the gotcha did not bite locally. Still probe
+> for it on any new target host before assuming — the symptom appears on the
+> first `Consumer(...)` construction, so a one-liner that instantiates a
+> consumer with `sasl.mechanism=GSSAPI` is enough to check.
 
 ---
 
@@ -95,30 +109,40 @@ have different KDCs.
 
 ### Mapping onto this repo
 
-The lab Kerberos setup I added mirrors the **broker side** of this:
+The lab Kerberos setup mirrors **both sides** of this:
 
-- `docker-compose.kerberos.yml` + the `kerberos/` dir stand up a KDC, mint the
-  `kafka/localhost` SPN keytab, and switch the broker's client listener to
-  `SASL_PLAINTEXT/GSSAPI`.
-- `config/local-kerberos.toml` configures the **client side** for `kafka-python`:
+- **Broker side:** `docker-compose.kerberos.yml` + the `kerberos/` dir stand up
+  a KDC, mint the `kafka/localhost` SPN keytab, and switch the broker's client
+  listener to `SASL_PLAINTEXT/GSSAPI`
+  (`scripts/verify_kerberos_broker.sh` proves this with the Java console tools).
+- **Client side:** `config/local-kerberos.toml` `[kafka.client]` carries the
+  same librdkafka properties the reference uses, minus TLS:
   ```toml
-  security_protocol = "SASL_PLAINTEXT"   # lab: no TLS. Prod equivalent: "SASL_SSL"
-  sasl_mechanism = "GSSAPI"
-  sasl_kerberos_service_name = "kafka"
-  sasl_kerberos_domain_name = "localhost"
+  "security.protocol" = "SASL_PLAINTEXT"   # lab: no TLS. Prod equivalent: "SASL_SSL"
+  "sasl.mechanism" = "GSSAPI"
+  "sasl.kerberos.service.name" = "kafka"
+  "sasl.kerberos.principal" = "client@EXAMPLE.COM"
+  "sasl.kerberos.keytab" = "kerberos/keytabs/client.keytab"
   ```
-  `etl.config.kafka_sasl_kwargs()` forwards those to the `kafka-python` client.
+  The keytab is the client's own credential, exported from the KDC container to
+  the host; `librdkafka` auto-`kinit`s from it (no interactive password). Two
+  host-side details make this work: `KRB5_CONFIG` must point at
+  `kerberos/krb5-host.conf` (which reaches the KDC via the published
+  `localhost:88` port instead of the compose-network name `kdc`), and the
+  keytab path is repo-relative, so run clients from the repo root.
+  `scripts/verify_kerberos_avro_consumer.sh` wires all of this up and proves
+  keytab auth + Avro decode + the EOD save-gate in one consume flow.
 
-The conceptual gap between lab and prod is exactly: **`SASL_PLAINTEXT` → `SASL_SSL`**
-(add a truststore) and **keytab is held by the broker container** vs **keytab is
-held by you, the client**. The auth mechanism (GSSAPI against a `kafka/...` SPN)
-is identical.
+The conceptual gap between lab and prod is now exactly:
+**`SASL_PLAINTEXT` → `SASL_SSL`** (add `ssl.ca.location`, per `config/prod.toml`)
+and real principal/keytab/realm values instead of the lab's
+`client@EXAMPLE.COM`. The auth mechanism (keytab-based GSSAPI against a
+`kafka/...` SPN) is identical.
 
 > Note: `kafka-python` does **not** auto-`kinit` from a keytab the way
-> `librdkafka` does. With `kafka-python` you must have a valid TGT in the ambient
-> credential cache first (`kinit -kt your.keytab your_principal`). `librdkafka`
-> (the reference) takes `sasl.kerberos.keytab` + `sasl.kerberos.principal` and
-> does the `kinit` for you.
+> `librdkafka` does — one of the reasons this repo migrated to
+> `confluent-kafka`. `librdkafka` takes `sasl.kerberos.keytab` +
+> `sasl.kerberos.principal` and does the `kinit` for you.
 
 ---
 
@@ -165,12 +189,13 @@ just like our pipeline (print as JSON / convert / save).
 
 ### Mapping onto this repo
 
-`etl` has no Avro support today. If the upstream topic is Avro, the change is
-localized to **decoding**: replace `decode_kafka_value()`'s `json.loads` with an
-`AvroDeserializer` call, and add Schema-Registry settings to config
-(`schema_registry_url`, truststore). The conversion step (`convert_control_message`)
-is unaffected — it already takes a `dict`. The `id_attribute` lookup would then
-read a field out of the Avro-derived dict instead of a JSON-derived one.
+This is now implemented: `etl.avro_io` wraps `SchemaRegistryClient` +
+`AvroDeserializer` (auto-detect mode), and `consume_messages()` decodes every
+message value through it before the save-gate runs. The conversion step
+(`convert_control_message`) was unaffected — it already took a `dict`; the
+`id_attribute` lookup just reads a field out of the Avro-derived dict instead
+of a JSON-derived one. `[schema_registry]` in each `config/*.toml` carries the
+registry client properties (`url`, plus `ssl.ca.location` in prod).
 
 ---
 
