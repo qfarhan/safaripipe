@@ -78,13 +78,17 @@ def test_write_hits_jsonl_writes_one_doc_per_line(tmp_path):
     assert [json.loads(line)["_id"] for line in lines] == ["1", "2", "3"]
 
 
+def _fake_client(total):
+    return SimpleNamespace(count=lambda **kwargs: {"count": total})
+
+
 def test_run_lookup_scrolls_all_hits_and_writes_file(monkeypatch, tmp_path):
     # Simulate a batch with more matching records than a single search page
     # (default size 10 / max_result_window 10000) would ever return.
     fake_hits = [{"_id": str(i), "batchId": "batch-9"} for i in range(25)]
 
     monkeypatch.setattr(es_lookup, "load_config", lambda env: _config())
-    monkeypatch.setattr(es_lookup, "create_es_client", lambda es_config: object())
+    monkeypatch.setattr(es_lookup, "create_es_client", lambda es_config: _fake_client(25))
     monkeypatch.setattr(
         es_lookup,
         "scan_all_hits",
@@ -97,7 +101,31 @@ def test_run_lookup_scrolls_all_hits_and_writes_file(monkeypatch, tmp_path):
     )
 
     assert result["record_count"] == 25
+    assert result["total_matches"] == 25
+    assert "warning" not in result
     assert result["output_file"] == str(output_file)
     assert "response" not in result
     written = [json.loads(line) for line in output_file.read_text(encoding="utf-8").splitlines()]
     assert written == fake_hits
+
+
+def test_run_lookup_warns_when_scroll_returns_fewer_than_count(monkeypatch, tmp_path):
+    # ES says 40 docs match but the scroll only yields 25: the result must flag
+    # the truncation instead of silently under-reporting the batch.
+    fake_hits = [{"_id": str(i), "batchId": "batch-9"} for i in range(25)]
+
+    monkeypatch.setattr(es_lookup, "load_config", lambda env: _config())
+    monkeypatch.setattr(es_lookup, "create_es_client", lambda es_config: _fake_client(40))
+    monkeypatch.setattr(
+        es_lookup,
+        "scan_all_hits",
+        lambda client, *, index, query, size, scroll_timeout: iter(fake_hits),
+    )
+
+    result = es_lookup.run_lookup(
+        env="local", direct_id="batch-9", output_file=str(tmp_path / "results.jsonl")
+    )
+
+    assert result["record_count"] == 25
+    assert result["total_matches"] == 40
+    assert "scroll did not return every matching document" in result["warning"]

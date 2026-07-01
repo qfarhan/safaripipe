@@ -142,6 +142,14 @@ def run_lookup(
 
     client = create_es_client(config.elasticsearch)
 
+    # Ask ES how many docs match before scrolling, so a shortfall in the output
+    # can be localized: total_matches below the expected batch size means the
+    # query itself matches too few docs (wrong term_field/index/id value), while
+    # record_count below total_matches means the scroll was cut short (scroll
+    # timeout, proxy dropping scroll-context affinity, security blocking the
+    # scroll API).
+    total_matches = int(client.count(index=index, query=query["query"])["count"])
+
     # A batch can span thousands of records (well past the default 10-hit page
     # and the 10k max_result_window), so every matching doc is scrolled and
     # streamed straight to disk rather than collected into one big response or
@@ -161,13 +169,22 @@ def run_lookup(
     )
     record_count = write_hits_jsonl(destination, hits)
 
-    return {
+    result = {
         "dry_run": False,
         "index": index,
         "query": query,
         "output_file": str(destination),
+        "total_matches": total_matches,
         "record_count": record_count,
     }
+    if record_count != total_matches:
+        result["warning"] = (
+            f"record_count ({record_count}) != total_matches ({total_matches}): "
+            "the scroll did not return every matching document. Check the scroll "
+            "timeout, and whether a proxy/load balancer or cluster security "
+            "settings interfere with the scroll API."
+        )
+    return result
 
 
 def parse_args() -> argparse.Namespace:
