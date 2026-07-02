@@ -6,6 +6,8 @@ requires-python = ">=3.11"
 dependencies = [
   "elasticsearch>=8.13,<9",
   "confluent-kafka[avro]>=2.4,<3",
+  # Field-spec YAML for the per-feed JSON->CSV transforms (src/json_transform/).
+  "pyyaml>=6,<7",
 ]
 
 [project.optional-dependencies]

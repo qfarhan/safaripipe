@@ -61,3 +61,43 @@ api_key = ""
 output_dir = "data/es_results"
 scroll_size = 1000
 scroll_timeout = "2m"
+
+# ---------------------------------------------------------------------------
+# Scheduled EOD pipeline (etl.eod_runner): the "batch complete" signal is read
+# from an Elasticsearch CONTROL index populated by the source system, not from
+# Kafka. The Kafka consumer above is kept as a fallback/testing path.
+# ---------------------------------------------------------------------------
+
+[eod]
+# Runtime, mutable state lives under data/state/ (gitignored) — never in config.
+state_file = "data/state/eod_state.json"
+log_dir = "data/logs"
+csv_dir = "data/csv"
+# The runner re-checks this many days before --date, so a feed whose End
+# arrives late (or a corrected batch) is picked up on a later cron run. A past
+# date still missing its End batch is reported as a MISSING warning.
+lookback_days = 3
+
+# One [[feeds]] entry per feed. All ES field paths are per-feed configuration —
+# real control indices differ from the sample Avro schema (control.action /
+# control.eodDate vs control.batch.processStatus), so nothing is hardcoded.
+[[feeds]]
+name = "facility"
+# Query the ALIAS, not the versioned -r1 index behind it.
+control_index = "ist.enterprise.c360.facility.eod.control.v1"
+data_index = "ist.enterprise.c360.facility.eod.data.v1"
+# Fields used to find the day's completed batch in the control index. These are
+# used in term queries (filter context), so they must resolve to keyword/date
+# fields — append .keyword if the field is mapped as text with a subfield.
+action_field = "control.action"
+action_value = "End"
+date_field = "control.eodDate"
+# Dotted JSON path of the join key inside the control document _source.
+batch_id_field = "header.batchId"
+# Optional: expected record count in the control doc; when present the runner
+# asserts the extracted record_count matches before marking the step done.
+batch_size_field = "control.batchSizeIntended"
+# Field the batchId is matched against in the DATA index (keyword subfield).
+data_term_field = "header.batchId.keyword"
+# Per-feed transform command; the runner appends <input.jsonl> <output.csv>.
+transform = ["python", "src/json_transform/transform_facility_to_csv.py"]

@@ -1,0 +1,51 @@
+meta:
+  interface_name: C360Facility
+  source_format: jsonl   # es_lookup output: one Elasticsearch hit per line
+  output: csv
+  notes: >
+    TEMPLATE field spec for the facility feed — the dotted paths below reflect
+    the expected shape of documents in ist.enterprise.c360.facility.eod.data.v1
+    and must be verified against a real batch before production use. Copy this
+    file (and transform_facility_to_csv.py) as the starting point for each new
+    feed.
+fields:
+  - name: BATCH_ID
+    label: "EOD Batch ID"
+    type: str
+    required: true
+    nullable: false
+    intermediate_mapping: "header.batchId"
+    exception_level: ERROR
+    exception_message: "Mandatory; every data record must carry the batch join key."
+  - name: MESSAGE_ID
+    label: "Message ID"
+    type: str
+    required: true
+    nullable: false
+    intermediate_mapping: "header.messageId"
+    exception_level: ERROR
+    exception_message: "Mandatory; globally unique record identifier."
+  - name: FACILITY_ID
+    label: "Facility ID"
+    type: str
+    required: true
+    nullable: false
+    intermediate_mapping: "facility.facilityId"
+    exception_level: ERROR
+    exception_message: "Mandatory; flag as error if the facility ID is missing."
+  - name: FACILITY_NAME
+    label: "Facility Name"
+    type: str
+    required: false
+    nullable: true
+    intermediate_mapping: "facility.facilityName"
+    exception_level: WARNING
+    exception_message: "Optional; written empty and flagged when missing."
+  - name: SOURCE_SYSTEM
+    label: "Source System"
+    type: code
+    required: true
+    nullable: false
+    intermediate_mapping: "C360"
+    exception_level: ERROR
+    exception_message: "Constant source-system code."

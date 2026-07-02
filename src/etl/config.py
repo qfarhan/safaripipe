@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import tomllib
 from typing import Any
@@ -21,6 +21,14 @@ class AppConfig:
     consumer: dict[str, Any]
     message: dict[str, Any]
     elasticsearch: dict[str, Any]
+    # eod holds runner-wide settings for the scheduled EOD pipeline: state_file,
+    # log_dir, csv_dir, lookback_days.
+    eod: dict[str, Any] = field(default_factory=dict)
+    # feeds is the [[feeds]] array: one entry per EOD feed, each declaring its
+    # control/data indices, field paths, and transform command. The shared
+    # [elasticsearch] block supplies the connection; per-feed entries supply
+    # only what differs between feeds.
+    feeds: list[dict[str, Any]] = field(default_factory=list)
 
 
 def load_config(env: str, config_dir: Path | None = None) -> AppConfig:
@@ -43,6 +51,8 @@ def load_config(env: str, config_dir: Path | None = None) -> AppConfig:
         consumer=dict(raw.get("consumer", {})),
         message=dict(raw.get("message", {})),
         elasticsearch=dict(raw.get("elasticsearch", {})),
+        eod=dict(raw.get("eod", {})),
+        feeds=[dict(feed) for feed in raw.get("feeds", [])],
     )
 
 

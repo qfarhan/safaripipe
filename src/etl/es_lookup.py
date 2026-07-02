@@ -112,6 +112,8 @@ def run_lookup(
     direct_id: str | None = None,
     dry_run: bool = False,
     output_file: str | None = None,
+    index: str | None = None,
+    term_field: str | None = None,
 ) -> dict[str, Any]:
     config = load_config(env)
     id_attribute = str(config.message.get("id_attribute", "event_id"))
@@ -119,8 +121,10 @@ def run_lookup(
     # JSON path it was read from: when batchId is mapped as `text` with a keyword
     # subfield, a term query must target `header.batchId.keyword`. term_field
     # overrides the query field; it defaults to id_attribute when unset.
-    term_field = str(config.elasticsearch.get("term_field", "") or id_attribute)
-    index = str(config.elasticsearch.get("index", "source-index"))
+    # Callers with several feeds (etl.eod_runner) pass index/term_field per feed;
+    # when omitted, the single [elasticsearch] config values apply as before.
+    term_field = str(term_field or config.elasticsearch.get("term_field", "") or id_attribute)
+    index = str(index or config.elasticsearch.get("index", "source-index"))
 
     id_value_for_filename = "query"
     if query_json:

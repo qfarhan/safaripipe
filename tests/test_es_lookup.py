@@ -129,3 +129,25 @@ def test_run_lookup_warns_when_scroll_returns_fewer_than_count(monkeypatch, tmp_
     assert result["record_count"] == 25
     assert result["total_matches"] == 40
     assert "scroll did not return every matching document" in result["warning"]
+
+
+def test_run_lookup_per_feed_overrides_take_precedence(monkeypatch):
+    # etl.eod_runner passes each feed's own data index + keyword term field;
+    # they must override the single [elasticsearch] config values.
+    monkeypatch.setattr(es_lookup, "load_config", lambda env: _config(term_field="header.batchId.keyword"))
+    result = es_lookup.run_lookup(
+        env="local",
+        direct_id="batch-9",
+        dry_run=True,
+        index="ist.enterprise.c360.facility.eod.data.v1",
+        term_field="header.batchId.raw",
+    )
+    assert result["index"] == "ist.enterprise.c360.facility.eod.data.v1"
+    assert result["query"] == {"query": {"term": {"header.batchId.raw": "batch-9"}}}
+
+
+def test_run_lookup_overrides_default_to_config_when_omitted(monkeypatch):
+    monkeypatch.setattr(es_lookup, "load_config", lambda env: _config(term_field="header.batchId.keyword"))
+    result = es_lookup.run_lookup(env="local", direct_id="batch-9", dry_run=True, index=None, term_field=None)
+    assert result["index"] == "source-index"
+    assert result["query"] == {"query": {"term": {"header.batchId.keyword": "batch-9"}}}

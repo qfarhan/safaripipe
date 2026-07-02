@@ -52,3 +52,32 @@ def test_local_kerberos_config_selects_gssapi():
     assert client["security.protocol"] == "SASL_PLAINTEXT"
     assert client["sasl.mechanism"] == "GSSAPI"
     assert client["sasl.kerberos.service.name"] == "kafka"
+
+
+def test_configs_declare_eod_feeds():
+    # Every env config must carry the [[feeds]] array and [eod] runner block
+    # for the scheduled EOD pipeline; field paths stay per-feed (never hardcoded).
+    for env in ("local", "dev", "prod"):
+        config = load_config(env)
+        assert config.eod["state_file"].startswith("data/state/")
+        assert config.feeds, f"{env}.toml has no [[feeds]]"
+        feed = config.feeds[0]
+        assert feed["name"] == "facility"
+        assert feed["control_index"].endswith(".v1")  # the alias, not -r1
+        for key in (
+            "data_index",
+            "action_field",
+            "action_value",
+            "date_field",
+            "batch_id_field",
+            "data_term_field",
+            "transform",
+        ):
+            assert key in feed, f"{env}.toml feed missing {key}"
+
+
+def test_app_config_defaults_keep_feeds_optional():
+    # Configs without [[feeds]] (e.g. local-kerberos) must still load.
+    config = load_config("local-kerberos")
+    assert config.feeds == []
+    assert config.eod == {}

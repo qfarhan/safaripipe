@@ -9,6 +9,13 @@ Two independent Python 3.11 components:
 
 Both components can run manually for debugging and both load environment-specific TOML configs.
 
+**Scheduled EOD pipeline:** for the end-of-day path, `etl.eod_runner` replaces the
+Kafka trigger with a cron-driven query against per-feed Elasticsearch **control
+indices** (the source system writes the `action=End` completion signal there), then
+extracts each batch via `etl.es_lookup` and converts it to CSV with a per-feed
+transform. The Kafka consumer above is kept as a fallback/testing path. See
+[`docs/eod-es-scheduled-pipeline.md`](docs/eod-es-scheduled-pipeline.md).
+
 The Kafka clients use **`confluent-kafka`** (librdkafka) with Confluent **Schema Registry /
 Avro** and support Kerberos (SASL/GSSAPI) — mirroring the production reference in
 [`reference/confluent_avro_consumer.py`](reference/confluent_avro_consumer.py). See
